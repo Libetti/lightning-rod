@@ -2,6 +2,8 @@
 
 Tiny FastAPI server for exposing recent NOAA GOES GLM flash events as JSON.
 
+`/lightning/recent` responses are cached in-memory per `(satellite, limit)` for 30 seconds to reduce repeated upstream fetches.
+
 ## Files
 
 - `main.py`: Server App and Endpoints (`/health`, `/lightning/recent`)

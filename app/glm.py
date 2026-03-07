@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import gettempdir
+from threading import Lock
+from time import monotonic
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
@@ -15,6 +17,7 @@ SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
+RECENT_CACHE_TTL_SECONDS = 30
 
 
 class GLMFetchError(Exception):
@@ -28,6 +31,16 @@ class FlashEvent:
     longitude: float
     time: str
     energy: float | None = None
+
+
+@dataclass
+class _RecentCacheEntry:
+    expires_at: float
+    events: list[FlashEvent]
+
+
+_recent_cache: dict[tuple[str, int], _RecentCacheEntry] = {}
+_recent_cache_lock = Lock()
 
 
 def _flatten_paths(values: list[object]) -> list[str]:
@@ -158,9 +171,25 @@ def fetch_recent_lightning(
     if not satellite_id:
         raise GLMFetchError("Unsupported satellite. Use goes-east or goes-west.")
 
+    cache_key = (satellite, limit)
+    now = monotonic()
+    with _recent_cache_lock:
+        cached = _recent_cache.get(cache_key)
+        if cached is not None and cached.expires_at > now:
+            # Return copies to keep cached entries immutable to callers.
+            return [replace(event) for event in cached.events]
+        if cached is not None:
+            _recent_cache.pop(cache_key, None)
+
     try:
         latest_file = _latest_glm_file(satellite_id=satellite_id)
-        return _parse_flashes(nc_path=latest_file, limit=limit)
+        events = _parse_flashes(nc_path=latest_file, limit=limit)
+        with _recent_cache_lock:
+            _recent_cache[cache_key] = _RecentCacheEntry(
+                expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
+                events=[replace(event) for event in events],
+            )
+        return events
     except GLMFetchError:
         raise
     except KeyError as exc:
