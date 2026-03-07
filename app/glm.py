@@ -12,7 +12,7 @@ from netCDF4 import Dataset, num2date
 
 
 SATELLITE_TO_ID = {
-    "goes-east": 16,
+    "goes-east": 19,
     "goes-west": 18,
 }
 
