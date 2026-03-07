@@ -46,7 +46,6 @@ def lightning_recent(
     try:
         flashes = fetch_recent_lightning(satellite=satellite, limit=limit)
     except GLMFetchError as exc:
-        print(satellite,limit)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     features = [LightningFeature(**flash.__dict__) for flash in flashes]
