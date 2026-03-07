@@ -17,7 +17,7 @@ SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-RECENT_CACHE_TTL_SECONDS = 30
+RECENT_CACHE_TTL_SECONDS = 180
 
 
 class GLMFetchError(Exception):
