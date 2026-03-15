@@ -9,7 +9,6 @@ from time import monotonic
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
-from goes2go.data import goes_latest
 from netCDF4 import Dataset, num2date
 
 
@@ -17,7 +16,7 @@ SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-RECENT_CACHE_TTL_SECONDS = 180
+RECENT_CACHE_TTL_SECONDS = 5
 
 
 class GLMFetchError(Exception):
@@ -41,6 +40,14 @@ class _RecentCacheEntry:
 
 _recent_cache: dict[tuple[str, int], _RecentCacheEntry] = {}
 _recent_cache_lock = Lock()
+_refresh_locks: dict[tuple[str, int], Lock] = {}
+_refresh_locks_guard = Lock()
+
+
+def _load_goes_latest():
+    from goes2go.data import goes_latest as _goes_latest
+
+    return _goes_latest
 
 
 def _flatten_paths(values: list[object]) -> list[str]:
@@ -70,12 +77,17 @@ def _download_from_public_bucket(s3_key: str) -> Path:
 
 def _latest_glm_file(satellite_id: int) -> Path:
     """Resolve and download the latest GLM file with goes2go."""
-    results = goes_latest(
-        satellite=satellite_id,
-        product="GLM",
-        return_as="filelist",
-        save_dir=gettempdir(),
-    )
+    try:
+        goes_latest = _load_goes_latest()
+        results = goes_latest(
+            satellite=satellite_id,
+            product="GLM",
+            return_as="filelist",
+            save_dir=gettempdir(),
+        )
+    except Exception as exc:
+        raise GLMFetchError(f"Unable to resolve latest GLM file with goes2go: {exc}") from exc
+
     if results is None:
         raise GLMFetchError("No recent GLM files were found.")
 
@@ -107,7 +119,15 @@ def _latest_glm_file(satellite_id: int) -> Path:
             else:
                 raise GLMFetchError("goes2go did not return a usable GLM file path.")
     return latest_path
-    
+
+
+def _refresh_lock_for(cache_key: tuple[str, int]) -> Lock:
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(cache_key)
+        if lock is None:
+            lock = Lock()
+            _refresh_locks[cache_key] = lock
+        return lock
 
 def _parse_flashes(nc_path: Path, limit: int) -> list[FlashEvent]:
     """Parse only needed fields.
@@ -181,18 +201,29 @@ def fetch_recent_lightning(
         if cached is not None:
             _recent_cache.pop(cache_key, None)
 
-    try:
-        latest_file = _latest_glm_file(satellite_id=satellite_id)
-        events = _parse_flashes(nc_path=latest_file, limit=limit)
+    refresh_lock = _refresh_lock_for(cache_key)
+    with refresh_lock:
+        now = monotonic()
         with _recent_cache_lock:
-            _recent_cache[cache_key] = _RecentCacheEntry(
-                expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
-                events=[replace(event) for event in events],
-            )
-        return events
-    except GLMFetchError:
-        raise
-    except KeyError as exc:
-        raise GLMFetchError(f"Unexpected GLM file format, missing variable: {exc}") from exc
-    except Exception as exc:
-        raise GLMFetchError(f"Unable to parse NOAA GLM data: {exc}") from exc
+            cached = _recent_cache.get(cache_key)
+            if cached is not None and cached.expires_at > now:
+                # Another in-flight request refreshed it while we waited.
+                return [replace(event) for event in cached.events]
+            if cached is not None:
+                _recent_cache.pop(cache_key, None)
+
+        try:
+            latest_file = _latest_glm_file(satellite_id=satellite_id)
+            events = _parse_flashes(nc_path=latest_file, limit=limit)
+            with _recent_cache_lock:
+                _recent_cache[cache_key] = _RecentCacheEntry(
+                    expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
+                    events=[replace(event) for event in events],
+                )
+            return events
+        except GLMFetchError:
+            raise
+        except KeyError as exc:
+            raise GLMFetchError(f"Unexpected GLM file format, missing variable: {exc}") from exc
+        except Exception as exc:
+            raise GLMFetchError(f"Unable to parse NOAA GLM data: {exc}") from exc
