@@ -6,9 +6,14 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from app.glm import GLMFetchError, RECENT_CACHE_TTL_SECONDS, fetch_recent_lightning
+from app.runtime_diagnostics import (
+    install_asyncio_exception_handler,
+    install_runtime_diagnostics,
+)
 
 
 app = FastAPI(title="Lightning Rod", version="0.1.0")
+install_runtime_diagnostics()
 
 
 class HealthResponse(BaseModel):
@@ -27,6 +32,11 @@ class LightningRecentResponse(BaseModel):
     satellite: str
     count: int
     features: list[LightningFeature]
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    install_asyncio_exception_handler()
 
 
 @app.get("/health", response_model=HealthResponse)

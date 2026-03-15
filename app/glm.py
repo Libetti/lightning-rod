@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from multiprocessing import get_context
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Lock
@@ -9,15 +12,16 @@ from time import monotonic
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
-from goes2go.data import goes_latest
 from netCDF4 import Dataset, num2date
 
+logger = logging.getLogger(__name__)
 
 SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-RECENT_CACHE_TTL_SECONDS = 180
+RECENT_CACHE_TTL_SECONDS = 10
+PARSE_SUBPROCESS_TIMEOUT_SECONDS = 20.0
 
 
 class GLMFetchError(Exception):
@@ -41,6 +45,15 @@ class _RecentCacheEntry:
 
 _recent_cache: dict[tuple[str, int], _RecentCacheEntry] = {}
 _recent_cache_lock = Lock()
+_refresh_locks: dict[tuple[str, int], Lock] = {}
+_refresh_locks_guard = Lock()
+_upstream_io_lock = Lock()
+
+
+def _load_goes_latest():
+    from goes2go.data import goes_latest as _goes_latest
+
+    return _goes_latest
 
 
 def _flatten_paths(values: list[object]) -> list[str]:
@@ -70,12 +83,17 @@ def _download_from_public_bucket(s3_key: str) -> Path:
 
 def _latest_glm_file(satellite_id: int) -> Path:
     """Resolve and download the latest GLM file with goes2go."""
-    results = goes_latest(
-        satellite=satellite_id,
-        product="GLM",
-        return_as="filelist",
-        save_dir=gettempdir(),
-    )
+    try:
+        goes_latest = _load_goes_latest()
+        results = goes_latest(
+            satellite=satellite_id,
+            product="GLM",
+            return_as="filelist",
+            save_dir=gettempdir(),
+            verbose=False,
+        )
+    except Exception as exc:
+        raise GLMFetchError(f"Unable to resolve latest GLM file with goes2go: {exc}") from exc
     if results is None:
         raise GLMFetchError("No recent GLM files were found.")
 
@@ -107,9 +125,18 @@ def _latest_glm_file(satellite_id: int) -> Path:
             else:
                 raise GLMFetchError("goes2go did not return a usable GLM file path.")
     return latest_path
-    
 
-def _parse_flashes(nc_path: Path, limit: int) -> list[FlashEvent]:
+
+def _refresh_lock_for(cache_key: tuple[str, int]) -> Lock:
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(cache_key)
+        if lock is None:
+            lock = Lock()
+            _refresh_locks[cache_key] = lock
+        return lock
+
+
+def _parse_flashes_direct(nc_path: Path, limit: int) -> list[FlashEvent]:
     """Parse only needed fields.
 
     TODO later: add bbox and time-window filtering here before returning results.
@@ -162,6 +189,56 @@ def _parse_flashes(nc_path: Path, limit: int) -> list[FlashEvent]:
         ds.close()
 
 
+def _parse_flashes_worker(nc_path: str, limit: int, queue: object) -> None:
+    try:
+        events = _parse_flashes_direct(Path(nc_path), limit)
+        queue.put(("ok", [event.__dict__ for event in events]))
+    except Exception as exc:
+        queue.put(("error", str(exc)))
+
+
+def _parse_flashes(nc_path: Path, limit: int) -> list[FlashEvent]:
+    # Native netCDF4 crashes can terminate the interpreter.
+    # Isolate parsing in a subprocess to keep the API worker alive.
+    if os.getenv("GLM_PARSE_IN_SUBPROCESS", "1") == "0":
+        return _parse_flashes_direct(nc_path, limit)
+
+    ctx = get_context("spawn")
+    queue = ctx.Queue(maxsize=1)
+    proc = ctx.Process(target=_parse_flashes_worker, args=(str(nc_path), limit, queue), daemon=True)
+    proc.start()
+    proc.join(PARSE_SUBPROCESS_TIMEOUT_SECONDS)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        raise GLMFetchError(
+            f"Timed out parsing GLM file after {PARSE_SUBPROCESS_TIMEOUT_SECONDS:.0f}s: {nc_path}"
+        )
+
+    if proc.exitcode is None:
+        raise GLMFetchError("GLM parser subprocess ended unexpectedly without an exit code.")
+
+    if proc.exitcode != 0:
+        logger.error("GLM parser subprocess crashed with exit code %s for %s", proc.exitcode, nc_path)
+        raise GLMFetchError(
+            f"GLM parser subprocess crashed (exit code {proc.exitcode}). "
+            "Likely native netCDF4/HDF5 instability."
+        )
+
+    if queue.empty():
+        raise GLMFetchError("GLM parser subprocess produced no output.")
+
+    status, payload = queue.get()
+    if status == "error":
+        raise GLMFetchError(f"Unable to parse NOAA GLM data: {payload}")
+
+    if not isinstance(payload, list):
+        raise GLMFetchError("GLM parser subprocess returned malformed payload.")
+
+    return [FlashEvent(**event_dict) for event_dict in payload]
+
+
 def fetch_recent_lightning(
     satellite: str = "goes-east",
     limit: int = 100,
@@ -181,18 +258,30 @@ def fetch_recent_lightning(
         if cached is not None:
             _recent_cache.pop(cache_key, None)
 
-    try:
-        latest_file = _latest_glm_file(satellite_id=satellite_id)
-        events = _parse_flashes(nc_path=latest_file, limit=limit)
+    refresh_lock = _refresh_lock_for(cache_key)
+    with refresh_lock:
+        now = monotonic()
         with _recent_cache_lock:
-            _recent_cache[cache_key] = _RecentCacheEntry(
-                expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
-                events=[replace(event) for event in events],
-            )
-        return events
-    except GLMFetchError:
-        raise
-    except KeyError as exc:
-        raise GLMFetchError(f"Unexpected GLM file format, missing variable: {exc}") from exc
-    except Exception as exc:
-        raise GLMFetchError(f"Unable to parse NOAA GLM data: {exc}") from exc
+            cached = _recent_cache.get(cache_key)
+            if cached is not None and cached.expires_at > now:
+                return [replace(event) for event in cached.events]
+            if cached is not None:
+                _recent_cache.pop(cache_key, None)
+
+        try:
+            # Reduce thread overlap in native code paths.
+            with _upstream_io_lock:
+                latest_file = _latest_glm_file(satellite_id=satellite_id)
+                events = _parse_flashes(nc_path=latest_file, limit=limit)
+            with _recent_cache_lock:
+                _recent_cache[cache_key] = _RecentCacheEntry(
+                    expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
+                    events=[replace(event) for event in events],
+                )
+            return events
+        except GLMFetchError:
+            raise
+        except KeyError as exc:
+            raise GLMFetchError(f"Unexpected GLM file format, missing variable: {exc}") from exc
+        except Exception as exc:
+            raise GLMFetchError(f"Unable to parse NOAA GLM data: {exc}") from exc
