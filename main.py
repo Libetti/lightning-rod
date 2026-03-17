@@ -2,9 +2,20 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from app.cmi import (
+    FRAMES_CACHE_TTL_SECONDS,
+    MAX_ZOOM,
+    POLL_INTERVAL_HINT_SECONDS,
+    CMIFetchError,
+    CMIFrameNotFoundError,
+    CMIInvalidTileError,
+    fetch_recent_cmi_frames,
+    render_tile,
+)
 from app.glm import GLMFetchError, RECENT_CACHE_TTL_SECONDS, fetch_recent_lightning
 from app.runtime_diagnostics import (
     install_asyncio_exception_handler,
@@ -32,6 +43,21 @@ class LightningRecentResponse(BaseModel):
     satellite: str
     count: int
     features: list[LightningFeature]
+
+
+class CMIFrameModel(BaseModel):
+    frame_id: str
+    satellite: str
+    start_time: str
+    end_time: str
+    tile_url_template: str
+
+
+class CMIFramesResponse(BaseModel):
+    satellite: str
+    count: int
+    poll_interval_seconds: int
+    frames: list[CMIFrameModel]
 
 
 @app.on_event("startup")
@@ -65,4 +91,68 @@ def lightning_recent(
         satellite=satellite,
         count=len(features),
         features=features,
+    )
+
+
+@app.get("/imagery/cmi/ch13/frames", response_model=CMIFramesResponse)
+def cmi_ch13_frames(
+    request: Request,
+    response: Response,
+    satellite: Literal["goes-east", "goes-west"] = Query(default="goes-east"),
+    limit: int = Query(default=12, ge=1, le=120),
+    poll_hint: int = Query(default=POLL_INTERVAL_HINT_SECONDS, ge=1, le=60),
+) -> CMIFramesResponse:
+    try:
+        frames = fetch_recent_cmi_frames(satellite=satellite, limit=limit)
+    except CMIFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    base_url = str(request.base_url).rstrip("/")
+    tile_template = (
+        f"{base_url}/imagery/cmi/ch13/tiles/{satellite}/"
+        "{frame_id}/{z}/{x}/{y}.png"
+    )
+    frame_models = [
+        CMIFrameModel(
+            frame_id=frame.frame_id,
+            satellite=frame.satellite,
+            start_time=frame.start_time,
+            end_time=frame.end_time,
+            tile_url_template=tile_template.replace("{frame_id}", frame.frame_id),
+        )
+        for frame in frames
+    ]
+    response.headers["Cache-Control"] = f"public, max-age={FRAMES_CACHE_TTL_SECONDS}"
+    return CMIFramesResponse(
+        satellite=satellite,
+        count=len(frame_models),
+        poll_interval_seconds=poll_hint,
+        frames=frame_models,
+    )
+
+
+@app.get("/imagery/cmi/ch13/tiles/{satellite}/{frame_id}/{z}/{x}/{y}.png")
+def cmi_ch13_tile(
+    satellite: Literal["goes-east", "goes-west"],
+    frame_id: str,
+    z: int,
+    x: int,
+    y: int,
+) -> FileResponse:
+    if z > MAX_ZOOM:
+        raise HTTPException(status_code=422, detail=f"Unsupported zoom level {z}; max is {MAX_ZOOM}.")
+
+    try:
+        tile_path = render_tile(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
+    except CMIFrameNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CMIInvalidTileError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except CMIFetchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return FileResponse(
+        path=tile_path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
