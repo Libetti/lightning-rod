@@ -1,15 +1,13 @@
 # Lightning Rod - NOAA GOES FastAPI Server
 
 Tiny FastAPI server for exposing NOAA GOES data for:
-- Recent GLM lightning flashes as JSON.
+- Latest GLM lightning frame metadata and points as JSON.
 - GOES ABI CMI Channel 13 (Clean IR) frame metadata and XYZ tiles for MapLibre.
-
-`/lightning/recent` responses are cached in-memory per `(satellite, limit)` for 10 seconds to reduce repeated upstream fetches.
 
 ## Files
 
 - `main.py`: Server app and API endpoints.
-- `app/glm.py`: NOAA fetch + GLM NetCDF parsing logic.
+- `app/glm.py`: background NOAA fetch + GLM parse + in-memory frame store.
 - `app/cmi.py`: NOAA fetch + CMI Ch13 frame discovery, raster prep, tile rendering, cache cleanup.
 - `requirements.txt`: runtime dependencies
 
@@ -37,10 +35,16 @@ Tiny FastAPI server for exposing NOAA GOES data for:
 4. Fetch endpoints:
 
    - Health: `http://127.0.0.1:8000/health`
-   - Recent flashes: `http://127.0.0.1:8000/lightning/recent`
-   - West satellite example: `http://127.0.0.1:8000/lightning/recent?satellite=goes-west&limit=50`
+   - Latest lightning frame: `http://127.0.0.1:8000/lightning/latest-frame`
+   - Latest lightning points: `http://127.0.0.1:8000/lightning/latest-points?satellite=goes-west&limit=1000`
    - CMI Ch13 frame list: `http://127.0.0.1:8000/imagery/cmi/ch13/frames?satellite=goes-east&limit=12`
    - CMI Ch13 tile template (from frame list): `http://127.0.0.1:8000/imagery/cmi/ch13/tiles/{satellite}/{frame_id}/{z}/{x}/{y}.png`
+
+## Lightning Notes
+
+- Satellites supported: `goes-east`, `goes-west`
+- The server ingests GLM data in a background poller and serves the latest cached frame/points from memory
+- Poll `/lightning/latest-frame` to detect new `frame_id`s, then fetch `/lightning/latest-points` when the frame changes
 
 ## CMI Ch13 Notes
 

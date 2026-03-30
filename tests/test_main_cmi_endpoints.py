@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse
 from starlette.requests import Request
 
 import main
-from app.cmi import CMIFrame
+from app.cmi import CMIFrame, FRAMES_CACHE_TTL_SECONDS
+from app.glm import FlashEvent, GLMFrame, GLMFetchError, RECENT_CACHE_TTL_SECONDS
 
 
 def _request(base_url: str = "http://testserver/") -> Request:
@@ -33,6 +34,51 @@ def _request(base_url: str = "http://testserver/") -> Request:
 
 
 class MainCMIEndpointTests(unittest.TestCase):
+    def test_lightning_latest_frame_returns_metadata(self) -> None:
+        frame = GLMFrame(
+            frame_id="glm-frame-1",
+            satellite="goes-east",
+            start_time="2026-03-30T00:00:00Z",
+            end_time="2026-03-30T00:02:00Z",
+            source_file="/tmp/frame.nc",
+        )
+        points = [FlashEvent(id="a", latitude=1.0, longitude=2.0, time="2026-03-30T00:01:00Z", energy=None)]
+
+        with patch.object(main, "get_latest_frame", return_value=(frame, "2026-03-30T00:02:30Z")), patch.object(
+            main, "get_latest_points", return_value=(frame, points, "2026-03-30T00:02:30Z")
+        ):
+            payload = main.lightning_latest_frame(satellite="goes-east")
+
+        self.assertEqual(payload.frame_id, "glm-frame-1")
+        self.assertEqual(payload.flash_count, 1)
+
+    def test_lightning_latest_points_returns_points_payload(self) -> None:
+        response = Response()
+        frame = GLMFrame(
+            frame_id="glm-frame-1",
+            satellite="goes-west",
+            start_time="2026-03-30T00:00:00Z",
+            end_time="2026-03-30T00:02:00Z",
+            source_file="/tmp/frame.nc",
+        )
+        points = [FlashEvent(id="a", latitude=1.0, longitude=2.0, time="2026-03-30T00:01:00Z", energy=None)]
+
+        with patch.object(main, "get_latest_points", return_value=(frame, points, "2026-03-30T00:02:30Z")):
+            payload = main.lightning_latest_points(response=response, satellite="goes-west", limit=100)
+
+        self.assertEqual(payload.frame_id, "glm-frame-1")
+        self.assertEqual(payload.count, 1)
+        self.assertEqual(response.headers["Cache-Control"], f"public, max-age={RECENT_CACHE_TTL_SECONDS}")
+
+    def test_lightning_latest_points_returns_503_without_cache(self) -> None:
+        response = Response()
+
+        with patch.object(main, "get_latest_points", side_effect=GLMFetchError("No cached lightning frame available yet.")):
+            with self.assertRaises(HTTPException) as ctx:
+                main.lightning_latest_points(response=response, satellite="goes-east", limit=100)
+
+        self.assertEqual(ctx.exception.status_code, 503)
+
     def test_frames_endpoint_returns_metadata(self) -> None:
         mock_frames = [
             CMIFrame(
@@ -66,7 +112,7 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertEqual(payload.poll_interval_seconds, 10)
         self.assertEqual(payload.frames[0].frame_id, "frame-new")
         self.assertIn("/imagery/cmi/ch13/tiles/goes-east/frame-new/", payload.frames[0].tile_url_template)
-        self.assertEqual(response.headers["Cache-Control"], "public, max-age=10")
+        self.assertEqual(response.headers["Cache-Control"], f"public, max-age={FRAMES_CACHE_TTL_SECONDS}")
 
     def test_frames_endpoint_supports_west_satellite(self) -> None:
         response = Response()
