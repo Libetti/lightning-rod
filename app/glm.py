@@ -1,287 +1,63 @@
 from __future__ import annotations
 
-import logging
-import os
-from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from multiprocessing import get_context
 from pathlib import Path
-from tempfile import gettempdir
-from threading import Lock
-from time import monotonic
-from urllib.error import URLError
-from urllib.request import urlretrieve
 
-from netCDF4 import Dataset, num2date
+from app import glm_ingest, glm_store
 
-logger = logging.getLogger(__name__)
-
-SATELLITE_TO_ID = {
-    "goes-east": 19,
-    "goes-west": 18,
-}
-RECENT_CACHE_TTL_SECONDS = 10
-PARSE_SUBPROCESS_TIMEOUT_SECONDS = 20.0
+SATELLITE_TO_ID = glm_ingest.SATELLITE_TO_ID
+POLL_INTERVAL_SECONDS = glm_ingest.POLL_INTERVAL_SECONDS
+RECENT_CACHE_TTL_SECONDS = glm_store.RECENT_CACHE_TTL_SECONDS
+FRAME_RETENTION_COUNT = glm_store.FRAME_RETENTION_COUNT
+GLMFetchError = glm_store.GLMFetchError
+FlashEvent = glm_store.FlashEvent
+GLMFrame = glm_store.GLMFrame
+_latest_by_satellite = glm_store._latest_by_satellite
+_frames_by_satellite = glm_store._frames_by_satellite
+_poller_stop_event = glm_ingest._poller_stop_event
 
 
-class GLMFetchError(Exception):
-    """Raised when we cannot fetch or parse NOAA GLM data."""
-
-
-@dataclass
-class FlashEvent:
-    id: str
-    latitude: float
-    longitude: float
-    time: str
-    energy: float | None = None
-
-
-@dataclass
-class _RecentCacheEntry:
-    expires_at: float
-    events: list[FlashEvent]
-
-
-_recent_cache: dict[tuple[str, int], _RecentCacheEntry] = {}
-_recent_cache_lock = Lock()
-_refresh_locks: dict[tuple[str, int], Lock] = {}
-_refresh_locks_guard = Lock()
-_upstream_io_lock = Lock()
-
-
-def _load_goes_latest():
-    from goes2go.data import goes_latest as _goes_latest
-
-    return _goes_latest
-
-
-def _flatten_paths(values: list[object]) -> list[str]:
-    flattened: list[str] = []
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, (list, tuple)):
-            flattened.extend(_flatten_paths(list(value)))
-            continue
-        flattened.append(str(value))
-    return flattened
-
-
-def _download_from_public_bucket(s3_key: str) -> Path:
-    # s3_key format: noaa-goesXX/path/to/file.nc
-    bucket, key = s3_key.split("/", 1)
-    filename = Path(key).name
-    local_path = Path(gettempdir()) / f"{bucket}_{filename}"
-    url = f"https://{bucket}.s3.amazonaws.com/{key}"
-    try:
-        urlretrieve(url, str(local_path))
-    except (URLError, OSError) as exc:
-        raise GLMFetchError(f"Unable to download GLM file from NOAA: {exc}") from exc
-    return local_path
+def _frame_from_path(satellite: str, path: Path) -> GLMFrame:
+    return glm_ingest.frame_from_path(satellite=satellite, path=path)
 
 
 def _latest_glm_file(satellite_id: int) -> Path:
-    """Resolve and download the latest GLM file with goes2go."""
-    try:
-        goes_latest = _load_goes_latest()
-        results = goes_latest(
-            satellite=satellite_id,
-            product="GLM",
-            return_as="filelist",
-            save_dir=gettempdir(),
-            verbose=False,
-        )
-    except Exception as exc:
-        raise GLMFetchError(f"Unable to resolve latest GLM file with goes2go: {exc}") from exc
-    if results is None:
-        raise GLMFetchError("No recent GLM files were found.")
-
-    raw_paths: list[object]
-    if isinstance(results, (str, Path)):
-        raw_paths = [results]
-    elif isinstance(results, list):
-        raw_paths = list(results)
-    elif hasattr(results, "columns") and "file" in results.columns:
-        # Older goes2go versions may return a pandas DataFrame.
-        raw_paths = list(results["file"].tolist())
-    else:
-        raise GLMFetchError("Unexpected goes2go response for latest GLM file.")
-
-    file_paths = _flatten_paths(raw_paths)
-    if not file_paths:
-        raise GLMFetchError("No recent GLM files were found.")
-
-    latest_candidate = file_paths[-1]
-    latest_path = Path(latest_candidate)
-    if not latest_path.exists():
-        tmp_relative_path = Path(gettempdir()) / latest_candidate
-        if tmp_relative_path.exists():
-            latest_path = tmp_relative_path
-        else:
-            s3_key = latest_candidate.removeprefix("s3://")
-            if s3_key.startswith("noaa-goes") and "/" in s3_key:
-                latest_path = _download_from_public_bucket(s3_key=s3_key)
-            else:
-                raise GLMFetchError("goes2go did not return a usable GLM file path.")
-    return latest_path
+    return glm_ingest.latest_glm_file(satellite_id=satellite_id)
 
 
-def _refresh_lock_for(cache_key: tuple[str, int]) -> Lock:
-    with _refresh_locks_guard:
-        lock = _refresh_locks.get(cache_key)
-        if lock is None:
-            lock = Lock()
-            _refresh_locks[cache_key] = lock
-        return lock
+def _parse_flashes_direct(nc_path: Path, limit: int | None = None) -> list[FlashEvent]:
+    return glm_ingest.parse_flashes_direct(nc_path=nc_path, limit=limit)
 
 
-def _parse_flashes_direct(nc_path: Path, limit: int) -> list[FlashEvent]:
-    """Parse only needed fields.
-
-    TODO later: add bbox and time-window filtering here before returning results.
-    """
-    ds = Dataset(str(nc_path), mode="r")
-    try:
-        flash_id_var = ds.variables["flash_id"]
-        flash_lat_var = ds.variables["flash_lat"]
-        flash_lon_var = ds.variables["flash_lon"]
-        flash_time_var = ds.variables["flash_time_offset_of_first_event"]
-        flash_energy_var = ds.variables.get("flash_energy")
-
-        ids = flash_id_var[:]
-        lats = flash_lat_var[:]
-        lons = flash_lon_var[:]
-        times = num2date(
-            flash_time_var[:],
-            units=flash_time_var.units,
-            only_use_cftime_datetimes=False,
-            only_use_python_datetimes=True,
-        )
-        energies = flash_energy_var[:] if flash_energy_var is not None else None
-
-        events: list[FlashEvent] = []
-        for i in range(min(len(ids), limit)):
-            time_value = times[i]
-            if isinstance(time_value, datetime):
-                time_iso = time_value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-            else:
-                time_iso = str(time_value)
-
-            energy_val: float | None = None
-            if energies is not None:
-                energy_candidate = float(energies[i])
-                if energy_candidate == energy_candidate:  # NaN guard
-                    energy_val = energy_candidate
-
-            events.append(
-                FlashEvent(
-                    id=str(ids[i]),
-                    latitude=float(lats[i]),
-                    longitude=float(lons[i]),
-                    time=time_iso,
-                    energy=energy_val,
-                )
-            )
-
-        return events
-    finally:
-        ds.close()
-
-
-def _parse_flashes_worker(nc_path: str, limit: int, queue: object) -> None:
-    try:
-        events = _parse_flashes_direct(Path(nc_path), limit)
-        queue.put(("ok", [event.__dict__ for event in events]))
-    except Exception as exc:
-        queue.put(("error", str(exc)))
-
-
-def _parse_flashes(nc_path: Path, limit: int) -> list[FlashEvent]:
-    # Native netCDF4 crashes can terminate the interpreter.
-    # Isolate parsing in a subprocess to keep the API worker alive.
-    if os.getenv("GLM_PARSE_IN_SUBPROCESS", "1") == "0":
-        return _parse_flashes_direct(nc_path, limit)
-
-    ctx = get_context("spawn")
-    queue = ctx.Queue(maxsize=1)
-    proc = ctx.Process(target=_parse_flashes_worker, args=(str(nc_path), limit, queue), daemon=True)
-    proc.start()
-    proc.join(PARSE_SUBPROCESS_TIMEOUT_SECONDS)
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
-        raise GLMFetchError(
-            f"Timed out parsing GLM file after {PARSE_SUBPROCESS_TIMEOUT_SECONDS:.0f}s: {nc_path}"
-        )
-
-    if proc.exitcode is None:
-        raise GLMFetchError("GLM parser subprocess ended unexpectedly without an exit code.")
-
-    if proc.exitcode != 0:
-        logger.error("GLM parser subprocess crashed with exit code %s for %s", proc.exitcode, nc_path)
-        raise GLMFetchError(
-            f"GLM parser subprocess crashed (exit code {proc.exitcode}). "
-            "Likely native netCDF4/HDF5 instability."
-        )
-
-    if queue.empty():
-        raise GLMFetchError("GLM parser subprocess produced no output.")
-
-    status, payload = queue.get()
-    if status == "error":
-        raise GLMFetchError(f"Unable to parse NOAA GLM data: {payload}")
-
-    if not isinstance(payload, list):
-        raise GLMFetchError("GLM parser subprocess returned malformed payload.")
-
-    return [FlashEvent(**event_dict) for event_dict in payload]
-
-
-def fetch_recent_lightning(
-    satellite: str = "goes-east",
-    limit: int = 100,
-) -> list[FlashEvent]:
-    """Fetch recent GLM flash events via goes2go."""
+def refresh_latest_lightning(satellite: str = "goes-east") -> GLMFrame:
     satellite_id = SATELLITE_TO_ID.get(satellite)
     if not satellite_id:
         raise GLMFetchError("Unsupported satellite. Use goes-east or goes-west.")
 
-    cache_key = (satellite, limit)
-    now = monotonic()
-    with _recent_cache_lock:
-        cached = _recent_cache.get(cache_key)
-        if cached is not None and cached.expires_at > now:
-            # Return copies to keep cached entries immutable to callers.
-            return [replace(event) for event in cached.events]
-        if cached is not None:
-            _recent_cache.pop(cache_key, None)
+    latest_file = _latest_glm_file(satellite_id=satellite_id)
+    frame = _frame_from_path(satellite=satellite, path=latest_file)
 
-    refresh_lock = _refresh_lock_for(cache_key)
-    with refresh_lock:
-        now = monotonic()
-        with _recent_cache_lock:
-            cached = _recent_cache.get(cache_key)
-            if cached is not None and cached.expires_at > now:
-                return [replace(event) for event in cached.events]
-            if cached is not None:
-                _recent_cache.pop(cache_key, None)
+    current_frame_id = glm_store.get_cached_frame_id(satellite)
+    if current_frame_id == frame.frame_id:
+        return frame
 
-        try:
-            # Reduce thread overlap in native code paths.
-            with _upstream_io_lock:
-                latest_file = _latest_glm_file(satellite_id=satellite_id)
-                events = _parse_flashes(nc_path=latest_file, limit=limit)
-            with _recent_cache_lock:
-                _recent_cache[cache_key] = _RecentCacheEntry(
-                    expires_at=monotonic() + RECENT_CACHE_TTL_SECONDS,
-                    events=[replace(event) for event in events],
-                )
-            return events
-        except GLMFetchError:
-            raise
-        except KeyError as exc:
-            raise GLMFetchError(f"Unexpected GLM file format, missing variable: {exc}") from exc
-        except Exception as exc:
-            raise GLMFetchError(f"Unable to parse NOAA GLM data: {exc}") from exc
+    events = _parse_flashes_direct(nc_path=latest_file, limit=None)
+    return glm_store.store_latest_points(frame=frame, events=events)
+
+
+def start_background_refresh() -> None:
+    glm_ingest.start_background_refresh()
+
+
+def stop_background_refresh() -> None:
+    glm_ingest.stop_background_refresh()
+
+
+def get_latest_frame(satellite: str = "goes-east") -> tuple[GLMFrame, str]:
+    return glm_store.get_latest_frame(satellite=satellite)
+
+
+def get_latest_points(
+    satellite: str = "goes-east",
+    limit: int | None = None,
+) -> tuple[GLMFrame, list[FlashEvent], str]:
+    return glm_store.get_latest_points(satellite=satellite, limit=limit)

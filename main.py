@@ -16,7 +16,14 @@ from app.cmi import (
     fetch_recent_cmi_frames,
     render_tile,
 )
-from app.glm import GLMFetchError, RECENT_CACHE_TTL_SECONDS, fetch_recent_lightning
+from app.glm import (
+    GLMFetchError,
+    RECENT_CACHE_TTL_SECONDS,
+    get_latest_frame,
+    get_latest_points,
+    start_background_refresh,
+    stop_background_refresh,
+)
 from app.runtime_diagnostics import (
     install_asyncio_exception_handler,
     install_runtime_diagnostics,
@@ -39,8 +46,21 @@ class LightningFeature(BaseModel):
     energy: float | None = None
 
 
-class LightningRecentResponse(BaseModel):
+class LightningFrameResponse(BaseModel):
+    frame_id: str
     satellite: str
+    start_time: str
+    end_time: str
+    flash_count: int
+    updated_at: str
+
+
+class LightningPointsResponse(BaseModel):
+    frame_id: str
+    satellite: str
+    start_time: str
+    end_time: str
+    updated_at: str
     count: int
     features: list[LightningFeature]
 
@@ -63,6 +83,12 @@ class CMIFramesResponse(BaseModel):
 @app.on_event("startup")
 async def startup() -> None:
     install_asyncio_exception_handler()
+    start_background_refresh()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    stop_background_refresh()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -70,27 +96,46 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.get("/lightning/recent", response_model=LightningRecentResponse)
-def lightning_recent(
+@app.get("/lightning/latest-frame", response_model=LightningFrameResponse)
+def lightning_latest_frame(
+    satellite: Literal["goes-east", "goes-west"] = Query(default="goes-east"),
+) -> LightningFrameResponse:
+    try:
+        frame, updated_at = get_latest_frame(satellite=satellite)
+        _, features, _ = get_latest_points(satellite=satellite)
+    except GLMFetchError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return LightningFrameResponse(
+        frame_id=frame.frame_id,
+        satellite=frame.satellite,
+        start_time=frame.start_time,
+        end_time=frame.end_time,
+        flash_count=len(features),
+        updated_at=updated_at,
+    )
+
+
+@app.get("/lightning/latest-points", response_model=LightningPointsResponse)
+def lightning_latest_points(
     response: Response,
     satellite: Literal["goes-east", "goes-west"] = Query(default="goes-east"),
-    limit: int = Query(default=100, ge=1, le=1000),
-) -> LightningRecentResponse:
-    """Return recent GLM flashes from NOAA GOES.
-
-    TODO later: add query params for bbox filtering and custom time windows.
-    """
+    limit: int = Query(default=1000, ge=1, le=5000),
+) -> LightningPointsResponse:
     try:
-        flashes = fetch_recent_lightning(satellite=satellite, limit=limit)
+        frame, points, updated_at = get_latest_points(satellite=satellite, limit=limit)
     except GLMFetchError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     response.headers["Cache-Control"] = f"public, max-age={RECENT_CACHE_TTL_SECONDS}"
-    features = [LightningFeature(**flash.__dict__) for flash in flashes]
-    return LightningRecentResponse(
-        satellite=satellite,
-        count=len(features),
-        features=features,
+    return LightningPointsResponse(
+        frame_id=frame.frame_id,
+        satellite=frame.satellite,
+        start_time=frame.start_time,
+        end_time=frame.end_time,
+        updated_at=updated_at,
+        count=len(points),
+        features=[LightningFeature(**flash.__dict__) for flash in points],
     )
 
 
