@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
     gcc \
+    libexpat1 \
     libproj-dev \
     proj-bin \
     proj-data \
