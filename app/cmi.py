@@ -189,6 +189,11 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
             verbose=False,
         )
     except Exception as exc:
+        logger.exception(
+            "Failed to list recent CMI files: satellite_id=%s lookback=%s",
+            satellite_id,
+            FRAME_LOOKBACK,
+        )
         raise CMIFetchError(f"Unable to resolve recent CMI files with goes2go: {exc}") from exc
 
     if results is None:
@@ -245,10 +250,21 @@ def _download_from_public_bucket(s3_key: str) -> Path:
         return local_path
 
     url = f"https://{bucket}.s3.amazonaws.com/{key}"
+    logger.info(
+        "Downloading CMI source file from NOAA: url=%s local_path=%s",
+        url,
+        local_path,
+    )
     try:
         urlretrieve(url, str(local_path))
     except (URLError, OSError) as exc:
+        logger.exception(
+            "Failed downloading CMI source file: url=%s local_path=%s",
+            url,
+            local_path,
+        )
         raise CMIFetchError(f"Unable to download CMI file from NOAA: {exc}") from exc
+    logger.info("Downloaded CMI source file: local_path=%s", local_path)
     return local_path
 
 
@@ -400,47 +416,77 @@ def ensure_frame_raster(frame_id: str, satellite: str = "goes-east") -> Path:
         if raster_path.exists():
             return raster_path
 
-        frame = _frame_record_for(satellite=satellite, frame_id=frame_id)
-        source_path = _materialize_file(frame.file_ref)
-
-        ds = Dataset(str(source_path), mode="r")
         try:
-            cmi_var = ds.variables["CMI"]
-            cmi_data = cmi_var[:]
-            if isinstance(cmi_data, np.ma.MaskedArray):
-                values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
-            else:
-                values = np.asarray(cmi_data, dtype=np.float32)
-            fill_value = getattr(cmi_var, "_FillValue", None)
-        except KeyError as exc:
-            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
-        finally:
-            ds.close()
+            frame = _frame_record_for(satellite=satellite, frame_id=frame_id)
+            source_path = _materialize_file(frame.file_ref)
+            logger.info(
+                "Building CMI raster: satellite=%s frame_id=%s source_path=%s raster_path=%s",
+                satellite,
+                frame_id,
+                source_path,
+                raster_path,
+            )
 
-        gray, alpha = _cmi_to_grayscale(values, fill_value=fill_value)
-        height, width = gray.shape
-        crs, transform = _projection_and_transform(source_path, width=width, height=height)
+            ds = Dataset(str(source_path), mode="r")
+            try:
+                cmi_var = ds.variables["CMI"]
+                cmi_data = cmi_var[:]
+                if isinstance(cmi_data, np.ma.MaskedArray):
+                    values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
+                else:
+                    values = np.asarray(cmi_data, dtype=np.float32)
+                fill_value = getattr(cmi_var, "_FillValue", None)
+            except KeyError as exc:
+                raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
+            finally:
+                ds.close()
 
-        raster_path.parent.mkdir(parents=True, exist_ok=True)
-        profile = {
-            "driver": "GTiff",
-            "width": width,
-            "height": height,
-            "count": 2,
-            "dtype": "uint8",
-            "crs": crs,
-            "transform": transform,
-            "compress": "deflate",
-            "predictor": 2,
-            "tiled": True,
-            "blockxsize": 512,
-            "blockysize": 512,
-        }
-        _, rasterio = _require_tile_dependencies()
-        with rasterio.open(raster_path, "w", **profile) as dst:
-            dst.write(gray, 1)
-            dst.write(alpha, 2)
+            gray, alpha = _cmi_to_grayscale(values, fill_value=fill_value)
+            height, width = gray.shape
+            crs, transform = _projection_and_transform(source_path, width=width, height=height)
 
+            raster_path.parent.mkdir(parents=True, exist_ok=True)
+            profile = {
+                "driver": "GTiff",
+                "width": width,
+                "height": height,
+                "count": 2,
+                "dtype": "uint8",
+                "crs": crs,
+                "transform": transform,
+                "compress": "deflate",
+                "predictor": 2,
+                "tiled": True,
+                "blockxsize": 512,
+                "blockysize": 512,
+            }
+            _, rasterio = _require_tile_dependencies()
+            with rasterio.open(raster_path, "w", **profile) as dst:
+                dst.write(gray, 1)
+                dst.write(alpha, 2)
+        except CMIFetchError:
+            logger.exception(
+                "Failed building CMI raster: satellite=%s frame_id=%s raster_path=%s",
+                satellite,
+                frame_id,
+                raster_path,
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error building CMI raster: satellite=%s frame_id=%s raster_path=%s",
+                satellite,
+                frame_id,
+                raster_path,
+            )
+            raise CMIFetchError(f"Unexpected error while building raster for {frame_id}: {exc}") from exc
+
+        logger.info(
+            "Built CMI raster: satellite=%s frame_id=%s raster_path=%s",
+            satellite,
+            frame_id,
+            raster_path,
+        )
         return raster_path
 
 
@@ -471,60 +517,104 @@ def render_tile(frame_id: str, satellite: str, z: int, x: int, y: int) -> Path:
         if tile_path.exists():
             return tile_path
 
-        raster_path = ensure_frame_raster(frame_id=frame_id, satellite=satellite)
-        tile_path.parent.mkdir(parents=True, exist_ok=True)
-
-        mercantile, rasterio = _require_tile_dependencies()
-        from rasterio.enums import Resampling
-        from rasterio.transform import from_bounds as transform_from_bounds
-        from rasterio.warp import reproject
-
-        bounds = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
-        tile_transform = transform_from_bounds(
-            bounds.left,
-            bounds.bottom,
-            bounds.right,
-            bounds.top,
-            TILE_SIZE,
-            TILE_SIZE,
-        )
-        gray = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-        alpha = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-
-        with rasterio.open(raster_path) as src:
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=gray,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=tile_transform,
-                dst_crs="EPSG:3857",
-                dst_nodata=0,
-                resampling=Resampling.bilinear,
-            )
-            reproject(
-                source=rasterio.band(src, 2),
-                destination=alpha,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=tile_transform,
-                dst_crs="EPSG:3857",
-                dst_nodata=0,
-                resampling=Resampling.nearest,
+        try:
+            raster_path = ensure_frame_raster(frame_id=frame_id, satellite=satellite)
+            tile_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Rendering CMI tile: satellite=%s frame_id=%s z=%s x=%s y=%s raster_path=%s tile_path=%s",
+                satellite,
+                frame_id,
+                z,
+                x,
+                y,
+                raster_path,
+                tile_path,
             )
 
-        rgba = np.stack((gray, gray, gray, alpha), axis=0).astype(np.uint8)
-        with rasterio.open(
+            mercantile, rasterio = _require_tile_dependencies()
+            from rasterio.enums import Resampling
+            from rasterio.transform import from_bounds as transform_from_bounds
+            from rasterio.warp import reproject
+
+            bounds = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
+            tile_transform = transform_from_bounds(
+                bounds.left,
+                bounds.bottom,
+                bounds.right,
+                bounds.top,
+                TILE_SIZE,
+                TILE_SIZE,
+            )
+            gray = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+            alpha = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+
+            with rasterio.open(raster_path) as src:
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=gray,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=tile_transform,
+                    dst_crs="EPSG:3857",
+                    dst_nodata=0,
+                    resampling=Resampling.bilinear,
+                )
+                reproject(
+                    source=rasterio.band(src, 2),
+                    destination=alpha,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=tile_transform,
+                    dst_crs="EPSG:3857",
+                    dst_nodata=0,
+                    resampling=Resampling.nearest,
+                )
+
+            rgba = np.stack((gray, gray, gray, alpha), axis=0).astype(np.uint8)
+            with rasterio.open(
+                tile_path,
+                "w",
+                driver="PNG",
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                count=4,
+                dtype="uint8",
+            ) as dst:
+                dst.write(rgba)
+        except CMIFetchError:
+            logger.exception(
+                "Failed rendering CMI tile: satellite=%s frame_id=%s z=%s x=%s y=%s tile_path=%s",
+                satellite,
+                frame_id,
+                z,
+                x,
+                y,
+                tile_path,
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error rendering CMI tile: satellite=%s frame_id=%s z=%s x=%s y=%s tile_path=%s",
+                satellite,
+                frame_id,
+                z,
+                x,
+                y,
+                tile_path,
+            )
+            raise CMIFetchError(
+                f"Unexpected error while rendering tile for {frame_id} ({z}/{x}/{y}): {exc}"
+            ) from exc
+
+        logger.info(
+            "Rendered CMI tile: satellite=%s frame_id=%s z=%s x=%s y=%s tile_path=%s",
+            satellite,
+            frame_id,
+            z,
+            x,
+            y,
             tile_path,
-            "w",
-            driver="PNG",
-            width=TILE_SIZE,
-            height=TILE_SIZE,
-            count=4,
-            dtype="uint8",
-        ) as dst:
-            dst.write(rgba)
-
+        )
         return tile_path
 
 

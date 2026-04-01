@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -29,6 +30,8 @@ from app.runtime_diagnostics import (
     install_runtime_diagnostics,
 )
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Lightning Rod", version="0.1.0")
 install_runtime_diagnostics()
@@ -150,6 +153,12 @@ def cmi_ch13_frames(
     try:
         frames = fetch_recent_cmi_frames(satellite=satellite, limit=limit)
     except CMIFetchError as exc:
+        logger.exception(
+            "CMI frames request failed: satellite=%s limit=%s poll_hint=%s",
+            satellite,
+            limit,
+            poll_hint,
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     base_url = str(request.base_url).rstrip("/")
@@ -190,10 +199,34 @@ def cmi_ch13_tile(
     try:
         tile_path = render_tile(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
     except CMIFrameNotFoundError as exc:
+        logger.warning(
+            "CMI tile request referenced unknown frame: satellite=%s frame_id=%s z=%s x=%s y=%s",
+            satellite,
+            frame_id,
+            z,
+            x,
+            y,
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except CMIInvalidTileError as exc:
+        logger.warning(
+            "CMI tile request used invalid tile coordinates: satellite=%s frame_id=%s z=%s x=%s y=%s",
+            satellite,
+            frame_id,
+            z,
+            x,
+            y,
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except CMIFetchError as exc:
+        logger.exception(
+            "CMI tile request failed: satellite=%s frame_id=%s z=%s x=%s y=%s",
+            satellite,
+            frame_id,
+            z,
+            x,
+            y,
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return FileResponse(
