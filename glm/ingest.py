@@ -47,6 +47,34 @@ def _flatten_paths(values: list[object]) -> list[str]:
     return flattened
 
 
+def _local_glm_search_roots(satellite_id: int) -> list[Path]:
+    bucket = f"noaa-goes{satellite_id}"
+    temp_root = Path(gettempdir())
+    return [
+        temp_root / bucket / "GLM-L2-LCFA",
+        temp_root / bucket,
+    ]
+
+
+def _latest_local_glm_file(satellite_id: int) -> Path | None:
+    candidates: list[Path] = []
+    for root in _local_glm_search_roots(satellite_id):
+        if not root.exists():
+            continue
+        candidates.extend(path for path in root.rglob("*.nc") if path.is_file())
+
+    if not candidates:
+        return None
+
+    def _sort_key(path: Path) -> tuple[str, str, str]:
+        match = GLM_TOKEN_PATTERN.search(path.name)
+        if match is None:
+            return ("", "", path.name)
+        return (match.group(1), match.group(2), path.name)
+
+    return max(candidates, key=_sort_key)
+
+
 def _download_from_public_bucket(s3_key: str) -> Path:
     bucket, key = s3_key.split("/", 1)
     local_path = Path(gettempdir()) / bucket / key
@@ -87,6 +115,7 @@ def frame_from_path(satellite: str, path: Path) -> GLMFrame:
 
 
 def latest_glm_file(satellite_id: int) -> Path:
+    local_latest = _latest_local_glm_file(satellite_id=satellite_id)
     try:
         goes_latest = _load_goes_latest()
         results = goes_latest(
@@ -97,8 +126,17 @@ def latest_glm_file(satellite_id: int) -> Path:
             verbose=False,
         )
     except Exception as exc:
+        if local_latest is not None:
+            logger.warning(
+                "Falling back to locally cached GLM file for satellite %s after goes2go failure: %s",
+                satellite_id,
+                exc,
+            )
+            return local_latest
         raise GLMFetchError(f"Unable to resolve latest GLM file with goes2go: {exc}") from exc
     if results is None:
+        if local_latest is not None:
+            return local_latest
         raise GLMFetchError("No recent GLM files were found.")
 
     raw_paths: list[object]
@@ -113,6 +151,8 @@ def latest_glm_file(satellite_id: int) -> Path:
 
     file_paths = _flatten_paths(raw_paths)
     if not file_paths:
+        if local_latest is not None:
+            return local_latest
         raise GLMFetchError("No recent GLM files were found.")
 
     latest_candidate = file_paths[-1]
@@ -127,6 +167,9 @@ def latest_glm_file(satellite_id: int) -> Path:
     s3_key = latest_candidate.removeprefix("s3://")
     if s3_key.startswith("noaa-goes") and "/" in s3_key:
         return _download_from_public_bucket(s3_key=s3_key)
+
+    if local_latest is not None:
+        return local_latest
 
     raise GLMFetchError("goes2go did not return a usable GLM file path.")
 

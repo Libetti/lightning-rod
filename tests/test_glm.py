@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -57,6 +58,27 @@ class GLMUnitTests(unittest.TestCase):
 
         self.assertEqual(parse_mock.call_count, 1)
         self.assertEqual(len(glm._frames_by_satellite["goes-east"]), 1)
+
+    def test_latest_glm_file_falls_back_to_local_cache_when_goes2go_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cached = (
+                Path(tmp_dir)
+                / "noaa-goes19"
+                / "GLM-L2-LCFA"
+                / "2026"
+                / "094"
+                / "22"
+                / "OR_GLM-L2-LCFA_G19_s20260942244200_e20260942244400_c20260942244417.nc"
+            )
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"nc")
+
+            with patch.object(glm.ingest, "gettempdir", return_value=tmp_dir), patch.object(
+                glm.ingest, "_load_goes_latest", side_effect=RuntimeError("network down")
+            ):
+                resolved = glm._latest_glm_file(19)
+
+        self.assertEqual(resolved, cached)
 
 if __name__ == "__main__":
     unittest.main()

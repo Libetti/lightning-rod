@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
@@ -92,6 +93,40 @@ def _flatten_paths(values: list[object]) -> list[str]:
     return flattened
 
 
+def _local_cmi_search_roots(satellite_id: int) -> list[Path]:
+    bucket = f"noaa-goes{satellite_id}"
+    temp_root = Path(gettempdir())
+    return [
+        SOURCE_DIR / bucket / "ABI-L2-CMIPF",
+        temp_root / bucket / "ABI-L2-CMIPF",
+        SOURCE_DIR / bucket,
+        temp_root / bucket,
+    ]
+
+
+def _local_cmi_file_refs(satellite_id: int) -> list[str]:
+    candidates: dict[Path, Path] = {}
+    for root in _local_cmi_search_roots(satellite_id):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.nc"):
+            if path.is_file() and "ABI-L2-CMIPF" in path.name:
+                candidates[path] = path
+
+    if not candidates:
+        return []
+
+    def _sort_key(path: Path) -> tuple[str, str, str]:
+        try:
+            start_token, end_token = _extract_tokens(path.name)
+        except CMIFetchError:
+            return ("", "", path.name)
+        return (start_token, end_token, path.name)
+
+    ordered = sorted(candidates.values(), key=_sort_key, reverse=True)
+    return [str(path) for path in ordered]
+
+
 def _extract_tokens(filename: str) -> tuple[str, str]:
     match = FRAME_TOKEN_PATTERN.search(filename)
     if match is None:
@@ -134,6 +169,7 @@ def _tile_lock_for(satellite: str, frame_id: str, z: int, x: int, y: int) -> Loc
 
 
 def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
+    local_refs = _local_cmi_file_refs(satellite_id=satellite_id)
     try:
         goes_timerange = _load_goes_timerange()
         results = goes_timerange(
@@ -150,9 +186,18 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
             verbose=False,
         )
     except Exception as exc:
+        if local_refs:
+            logger.warning(
+                "Falling back to locally cached CMI files for satellite %s after goes2go failure: %s",
+                satellite_id,
+                exc,
+            )
+            return local_refs
         raise CMIFetchError(f"Unable to resolve recent CMI files with goes2go: {exc}") from exc
 
     if results is None:
+        if local_refs:
+            return local_refs
         raise CMIFetchError("No recent CMI files were found.")
 
     raw_paths: list[object]
@@ -167,6 +212,8 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
 
     file_refs = _flatten_paths(raw_paths)
     if not file_refs:
+        if local_refs:
+            return local_refs
         raise CMIFetchError("No recent CMI files were found.")
     return file_refs
 
@@ -414,16 +461,18 @@ def render_tile(frame: CMIFrame, z: int, x: int, y: int) -> Path:
 
         rgba = np.stack((gray, gray, gray, gray), axis=0).astype(np.uint8)
         rgba[3] = alpha
-        with rasterio.open(
-            tile_path,
-            "w",
-            driver="PNG",
-            width=TILE_SIZE,
-            height=TILE_SIZE,
-            count=4,
-            dtype="uint8",
-        ) as dst:
-            dst.write(rgba)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
+            with rasterio.open(
+                tile_path,
+                "w",
+                driver="PNG",
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                count=4,
+                dtype="uint8",
+            ) as dst:
+                dst.write(rgba)
         return tile_path
 
 
@@ -503,13 +552,6 @@ def start_background_refresh() -> None:
         if _poller_thread is not None and _poller_thread.is_alive():
             return
         _poller_stop_event.clear()
-        for satellite in SATELLITE_TO_ID:
-            try:
-                _prepare_latest_frame(satellite)
-            except CMIFetchError:
-                logger.exception("Failed to warm latest CMI frame for %s", satellite)
-            except Exception:
-                logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
         _poller_thread = Thread(target=_poll_loop, name="cmi-refresh-poller", daemon=True)
         _poller_thread.start()
 
