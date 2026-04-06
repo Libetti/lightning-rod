@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import os
+import threading
 import warnings
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 
 from cmi import ingest as cmi
+from cmi import service as cmi_service
 
 
 class CMIUnitTests(unittest.TestCase):
@@ -20,6 +22,8 @@ class CMIUnitTests(unittest.TestCase):
         store._frames_by_satellite.clear()
         store._frame_index.clear()
         cmi._poller_stop_event.clear()
+        with cmi._frame_warmups_guard:
+            cmi._frame_warmups.clear()
 
     def test_frames_from_file_refs_dedupes_and_sorts_newest_first(self) -> None:
         file_refs = [
@@ -91,7 +95,7 @@ class CMIUnitTests(unittest.TestCase):
 
             self.assertEqual(resolved, tile_path)
 
-    def test_prepare_frame_publishes_only_after_success(self) -> None:
+    def test_prepare_frame_publishes_after_raster_build(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -100,20 +104,45 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
 
+        prepared = None
         with patch.object(cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")), patch.object(
-            cmi, "render_tile", side_effect=RuntimeError("boom")
+            cmi, "render_tile", side_effect=AssertionError("tiles should render lazily")
         ):
-            with self.assertRaises(RuntimeError):
-                cmi.prepare_frame(frame)
+            prepared = cmi.prepare_frame(frame)
 
         from cmi import store
 
-        self.assertFalse(store.has_frame("goes-east", "frame-1"))
+        self.assertEqual(prepared, frame)
+        self.assertTrue(store.has_frame("goes-east", "frame-1"))
+
+    def test_get_prepared_tile_path_renders_tile_on_demand(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+
+        from cmi import store
+
+        store.store_prepared_frame(frame)
+
+        tile_path = Path("/tmp/frame-1.png")
+        with patch.object(cmi, "render_tile", return_value=tile_path) as render_mock:
+            resolved = cmi.get_prepared_tile_path(satellite="goes-east", frame_id="frame-1", z=2, x=1, y=3)
+
+        self.assertEqual(resolved, tile_path)
+        render_mock.assert_called_once_with(frame=frame, z=2, x=1, y=3)
 
     def test_start_background_refresh_starts_poller_without_blocking_warmup(self) -> None:
+        created_threads: list[object] = []
+
         class _FakeThread:
             def __init__(self, *args, **kwargs) -> None:
                 self.started = False
+                self.target = kwargs.get("target")
+                created_threads.append(self)
 
             def is_alive(self) -> bool:
                 return self.started
@@ -129,6 +158,9 @@ class CMIUnitTests(unittest.TestCase):
         ):
             cmi.start_background_refresh()
             cmi.stop_background_refresh()
+
+        self.assertEqual(len(created_threads), 1)
+        self.assertIs(created_threads[0].target, cmi._warm_latest_then_poll_loop)
 
     def test_list_recent_cmi_file_refs_falls_back_to_local_cache_when_goes2go_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -243,6 +275,121 @@ class CMIUnitTests(unittest.TestCase):
                         resolved = cmi.render_tile(frame=frame, z=0, x=0, y=0)
 
         self.assertEqual(resolved, tile_path)
+
+    def test_prepare_frame_with_tracking_collapses_concurrent_work(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+        start_gate = threading.Event()
+        release_gate = threading.Event()
+        results: list[cmi.CMIFrame] = []
+        errors: list[Exception] = []
+        prepare_calls: list[str] = []
+
+        def _fake_prepare(inner_frame: cmi.CMIFrame) -> cmi.CMIFrame:
+            prepare_calls.append(inner_frame.frame_id)
+            start_gate.set()
+            release_gate.wait(timeout=2.0)
+            return inner_frame
+
+        def _run_worker() -> None:
+            try:
+                results.append(cmi.prepare_frame_with_tracking(frame))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(cmi, "prepare_frame", side_effect=_fake_prepare):
+            owner = threading.Thread(target=_run_worker)
+            waiter = threading.Thread(target=_run_worker)
+            owner.start()
+            start_gate.wait(timeout=2.0)
+            waiter.start()
+            release_gate.set()
+            owner.join(timeout=2.0)
+            waiter.join(timeout=2.0)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(prepare_calls, ["frame-1"])
+        with cmi._frame_warmups_guard:
+            self.assertEqual(cmi._frame_warmups, {})
+
+    def test_prepare_frame_with_tracking_clears_registry_after_failure(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+        calls = {"count": 0}
+
+        def _fake_prepare(inner_frame: cmi.CMIFrame) -> cmi.CMIFrame:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("boom")
+            return inner_frame
+
+        with patch.object(cmi, "prepare_frame", side_effect=_fake_prepare):
+            with self.assertRaises(RuntimeError):
+                cmi.prepare_frame_with_tracking(frame)
+
+            prepared = cmi.prepare_frame_with_tracking(frame)
+
+        self.assertEqual(prepared, frame)
+        self.assertEqual(calls["count"], 2)
+        with cmi._frame_warmups_guard:
+            self.assertEqual(cmi._frame_warmups, {})
+
+    def test_service_get_recent_frames_reads_cache_only(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+
+        with patch.object(cmi_service.store, "get_recent_frames", return_value=[frame]) as get_recent_mock, patch.object(
+            cmi_service.ingest, "discover_recent_frames", side_effect=AssertionError("request path should not discover")
+        ):
+            frames = cmi_service.get_recent_frames(satellite="goes-east", limit=12)
+
+        self.assertEqual(frames, [frame])
+        get_recent_mock.assert_called_once_with(satellite="goes-east", limit=12)
+
+    def test_service_get_tile_path_waits_for_in_progress_warmup(self) -> None:
+        tile_path = Path("/tmp/frame-1.png")
+
+        with patch.object(
+            cmi_service.store, "get_frame", side_effect=cmi_service.CMIFrameNotFoundError("missing")
+        ), patch.object(
+            cmi_service.ingest, "wait_for_frame_warmup", return_value=cmi.CMIFrame(
+                frame_id="frame-1",
+                satellite="goes-east",
+                start_time="2026-03-16T10:00:00Z",
+                end_time="2026-03-16T10:09:59Z",
+                file_ref="s3://noaa-goes19/path/frame-1.nc",
+            )
+        ) as wait_mock, patch.object(
+            cmi_service.ingest, "get_prepared_tile_path",
+            side_effect=[cmi_service.CMIFrameNotFoundError("missing"), tile_path],
+        ) as get_tile_mock:
+            resolved = cmi_service.get_tile_path(
+                frame_id="frame-1",
+                satellite="goes-east",
+                z=2,
+                x=1,
+                y=1,
+            )
+
+        self.assertEqual(resolved, tile_path)
+        self.assertEqual(wait_mock.call_count, 2)
+        self.assertEqual(get_tile_mock.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -21,8 +21,16 @@ def get_recent_frames(satellite: str = "goes-east", limit: int = 12) -> list[CMI
 
 
 def get_tile_path(frame_id: str, satellite: str, z: int, x: int, y: int) -> Path:
-    store.get_frame(satellite=satellite, frame_id=frame_id)
-    return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
+    try:
+        store.get_frame(satellite=satellite, frame_id=frame_id)
+    except CMIFrameNotFoundError:
+        ingest.wait_for_frame_warmup(satellite=satellite, frame_id=frame_id)
+
+    try:
+        return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
+    except CMIFrameNotFoundError:
+        ingest.wait_for_frame_warmup(satellite=satellite, frame_id=frame_id)
+        return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
 
 
 def start_background_refresh() -> None:

@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
@@ -21,6 +22,7 @@ from cmi.store import (
     CMIFrameNotFoundError,
     CMIInvalidTileError,
     FRAME_RETENTION_COUNT,
+    get_frame,
     has_frame,
     store_prepared_frame,
 )
@@ -54,6 +56,15 @@ _frame_locks: dict[tuple[str, str], Lock] = {}
 _frame_locks_guard = Lock()
 _tile_locks: dict[tuple[str, str, int, int, int], Lock] = {}
 _tile_locks_guard = Lock()
+_frame_warmups: dict[tuple[str, str], "_FrameWarmupEntry"] = {}
+_frame_warmups_guard = Lock()
+
+
+@dataclass
+class _FrameWarmupEntry:
+    frame: CMIFrame
+    done: Event = field(default_factory=Event)
+    error: Exception | None = None
 
 
 def _ensure_cache_dirs() -> None:
@@ -166,6 +177,38 @@ def _tile_lock_for(satellite: str, frame_id: str, z: int, x: int, y: int) -> Loc
             lock = Lock()
             _tile_locks[key] = lock
         return lock
+
+
+def _begin_frame_warmup(frame: CMIFrame) -> tuple[_FrameWarmupEntry, bool]:
+    key = (frame.satellite, frame.frame_id)
+    with _frame_warmups_guard:
+        entry = _frame_warmups.get(key)
+        if entry is not None:
+            return entry, False
+
+        entry = _FrameWarmupEntry(frame=frame)
+        _frame_warmups[key] = entry
+        return entry, True
+
+
+def _finish_frame_warmup(entry: _FrameWarmupEntry, error: Exception | None = None) -> None:
+    key = (entry.frame.satellite, entry.frame.frame_id)
+    with _frame_warmups_guard:
+        entry.error = error
+        entry.done.set()
+        _frame_warmups.pop(key, None)
+
+
+def wait_for_frame_warmup(satellite: str, frame_id: str) -> CMIFrame:
+    with _frame_warmups_guard:
+        entry = _frame_warmups.get((satellite, frame_id))
+    if entry is None:
+        raise CMIFrameNotFoundError(f"Frame not found for {satellite}: {frame_id}")
+
+    entry.done.wait()
+    if entry.error is not None:
+        raise entry.error
+    return entry.frame
 
 
 def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
@@ -481,21 +524,32 @@ def prepare_frame(frame: CMIFrame) -> CMIFrame:
         return frame
 
     build_frame_raster(frame)
-    for z in range(MAX_ZOOM + 1):
-        limit = 1 << z
-        for x in range(limit):
-            for y in range(limit):
-                render_tile(frame, z=z, x=x, y=y)
-
     return store_prepared_frame(frame)
+
+
+def prepare_frame_with_tracking(frame: CMIFrame) -> CMIFrame:
+    entry, is_owner = _begin_frame_warmup(frame)
+    if not is_owner:
+        return wait_for_frame_warmup(frame.satellite, frame.frame_id)
+
+    try:
+        prepared = prepare_frame(frame)
+    except Exception as exc:
+        _finish_frame_warmup(entry, error=exc)
+        raise
+
+    _finish_frame_warmup(entry)
+    return prepared
 
 
 def get_prepared_tile_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path:
     _validate_tile_xyz(z=z, x=x, y=y)
     tile_path = tile_png_path(satellite, frame_id, z, x, y)
-    if not tile_path.exists():
-        raise CMIFrameNotFoundError(f"Frame not found for {satellite}: {frame_id}")
-    return tile_path
+    if tile_path.exists():
+        return tile_path
+
+    frame = get_frame(satellite=satellite, frame_id=frame_id)
+    return render_tile(frame=frame, z=z, x=x, y=y)
 
 
 def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> None:
@@ -522,7 +576,7 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
 def _prepare_latest_frame(satellite: str) -> None:
     frames = discover_recent_frames(satellite)
     if frames:
-        prepare_frame(frames[0])
+        prepare_frame_with_tracking(frames[0])
 
 
 def _poll_once() -> None:
@@ -532,7 +586,7 @@ def _poll_once() -> None:
             for frame in reversed(frames[:FRAME_RETENTION_COUNT]):
                 if has_frame(frame.satellite, frame.frame_id):
                     continue
-                prepare_frame(frame)
+                prepare_frame_with_tracking(frame)
         except CMIFetchError:
             logger.exception("Failed to refresh latest CMI frames for %s", satellite)
         except Exception:
@@ -546,13 +600,27 @@ def _poll_loop() -> None:
         _poller_stop_event.wait(POLL_INTERVAL_SECONDS)
 
 
+def _warm_latest_then_poll_loop() -> None:
+    for satellite in SATELLITE_TO_ID:
+        if _poller_stop_event.is_set():
+            return
+        try:
+            _prepare_latest_frame(satellite)
+        except CMIFetchError:
+            logger.exception("Failed to warm latest CMI frame for %s", satellite)
+        except Exception:
+            logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
+
+    _poll_loop()
+
+
 def start_background_refresh() -> None:
     global _poller_thread
     with _poller_lock:
         if _poller_thread is not None and _poller_thread.is_alive():
             return
         _poller_stop_event.clear()
-        _poller_thread = Thread(target=_poll_loop, name="cmi-refresh-poller", daemon=True)
+        _poller_thread = Thread(target=_warm_latest_then_poll_loop, name="cmi-refresh-poller", daemon=True)
         _poller_thread.start()
 
 
