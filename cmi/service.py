@@ -10,6 +10,7 @@ CMIFrameNotFoundError = store.CMIFrameNotFoundError
 CMIInvalidTileError = store.CMIInvalidTileError
 FRAMES_CACHE_TTL_SECONDS = store.FRAMES_CACHE_TTL_SECONDS
 POLL_INTERVAL_HINT_SECONDS = store.POLL_INTERVAL_HINT_SECONDS
+NATIVE_ZOOM = ingest.NATIVE_ZOOM
 MAX_ZOOM = ingest.MAX_ZOOM
 _latest_by_satellite = store._latest_by_satellite
 _frames_by_satellite = store._frames_by_satellite
@@ -21,8 +22,16 @@ def get_recent_frames(satellite: str = "goes-east", limit: int = 12) -> list[CMI
 
 
 def get_tile_path(frame_id: str, satellite: str, z: int, x: int, y: int) -> Path:
-    store.get_frame(satellite=satellite, frame_id=frame_id)
-    return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
+    try:
+        store.get_frame(satellite=satellite, frame_id=frame_id)
+    except CMIFrameNotFoundError:
+        ingest.wait_for_frame_warmup(satellite=satellite, frame_id=frame_id)
+
+    try:
+        return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
+    except CMIFrameNotFoundError:
+        ingest.wait_for_frame_warmup(satellite=satellite, frame_id=frame_id)
+        return ingest.get_prepared_tile_path(satellite=satellite, frame_id=frame_id, z=z, x=x, y=y)
 
 
 def start_background_refresh() -> None:

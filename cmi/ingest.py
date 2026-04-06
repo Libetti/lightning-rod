@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
@@ -20,6 +22,7 @@ from cmi.store import (
     CMIFrameNotFoundError,
     CMIInvalidTileError,
     FRAME_RETENTION_COUNT,
+    get_frame,
     has_frame,
     store_prepared_frame,
 )
@@ -31,11 +34,14 @@ SATELLITE_TO_ID = {
     "goes-west": 18,
 }
 POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "30"))
-MAX_ZOOM = 8
+NATIVE_ZOOM = int(os.getenv("CMI_NATIVE_ZOOM", "2"))
+MAX_ZOOM = NATIVE_ZOOM
 FRAME_LOOKBACK = "4h"
 TILE_SIZE = 256
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
+TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
+TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
 FRAME_RETENTION_SECONDS = 2 * 60 * 60
 
 CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
@@ -53,6 +59,15 @@ _frame_locks: dict[tuple[str, str], Lock] = {}
 _frame_locks_guard = Lock()
 _tile_locks: dict[tuple[str, str, int, int, int], Lock] = {}
 _tile_locks_guard = Lock()
+_frame_warmups: dict[tuple[str, str], "_FrameWarmupEntry"] = {}
+_frame_warmups_guard = Lock()
+
+
+@dataclass
+class _FrameWarmupEntry:
+    frame: CMIFrame
+    done: Event = field(default_factory=Event)
+    error: Exception | None = None
 
 
 def _ensure_cache_dirs() -> None:
@@ -90,6 +105,40 @@ def _flatten_paths(values: list[object]) -> list[str]:
             continue
         flattened.append(str(value))
     return flattened
+
+
+def _local_cmi_search_roots(satellite_id: int) -> list[Path]:
+    bucket = f"noaa-goes{satellite_id}"
+    temp_root = Path(gettempdir())
+    return [
+        SOURCE_DIR / bucket / "ABI-L2-CMIPF",
+        temp_root / bucket / "ABI-L2-CMIPF",
+        SOURCE_DIR / bucket,
+        temp_root / bucket,
+    ]
+
+
+def _local_cmi_file_refs(satellite_id: int) -> list[str]:
+    candidates: dict[Path, Path] = {}
+    for root in _local_cmi_search_roots(satellite_id):
+        if not root.exists():
+            continue
+        for path in root.rglob("*.nc"):
+            if path.is_file() and "ABI-L2-CMIPF" in path.name:
+                candidates[path] = path
+
+    if not candidates:
+        return []
+
+    def _sort_key(path: Path) -> tuple[str, str, str]:
+        try:
+            start_token, end_token = _extract_tokens(path.name)
+        except CMIFetchError:
+            return ("", "", path.name)
+        return (start_token, end_token, path.name)
+
+    ordered = sorted(candidates.values(), key=_sort_key, reverse=True)
+    return [str(path) for path in ordered]
 
 
 def _extract_tokens(filename: str) -> tuple[str, str]:
@@ -133,7 +182,40 @@ def _tile_lock_for(satellite: str, frame_id: str, z: int, x: int, y: int) -> Loc
         return lock
 
 
+def _begin_frame_warmup(frame: CMIFrame) -> tuple[_FrameWarmupEntry, bool]:
+    key = (frame.satellite, frame.frame_id)
+    with _frame_warmups_guard:
+        entry = _frame_warmups.get(key)
+        if entry is not None:
+            return entry, False
+
+        entry = _FrameWarmupEntry(frame=frame)
+        _frame_warmups[key] = entry
+        return entry, True
+
+
+def _finish_frame_warmup(entry: _FrameWarmupEntry, error: Exception | None = None) -> None:
+    key = (entry.frame.satellite, entry.frame.frame_id)
+    with _frame_warmups_guard:
+        entry.error = error
+        entry.done.set()
+        _frame_warmups.pop(key, None)
+
+
+def wait_for_frame_warmup(satellite: str, frame_id: str) -> CMIFrame:
+    with _frame_warmups_guard:
+        entry = _frame_warmups.get((satellite, frame_id))
+    if entry is None:
+        raise CMIFrameNotFoundError(f"Frame not found for {satellite}: {frame_id}")
+
+    entry.done.wait()
+    if entry.error is not None:
+        raise entry.error
+    return entry.frame
+
+
 def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
+    local_refs = _local_cmi_file_refs(satellite_id=satellite_id)
     try:
         goes_timerange = _load_goes_timerange()
         results = goes_timerange(
@@ -150,9 +232,18 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
             verbose=False,
         )
     except Exception as exc:
+        if local_refs:
+            logger.warning(
+                "Falling back to locally cached CMI files for satellite %s after goes2go failure: %s",
+                satellite_id,
+                exc,
+            )
+            return local_refs
         raise CMIFetchError(f"Unable to resolve recent CMI files with goes2go: {exc}") from exc
 
     if results is None:
+        if local_refs:
+            return local_refs
         raise CMIFetchError("No recent CMI files were found.")
 
     raw_paths: list[object]
@@ -167,6 +258,8 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
 
     file_refs = _flatten_paths(raw_paths)
     if not file_refs:
+        if local_refs:
+            return local_refs
         raise CMIFetchError("No recent CMI files were found.")
     return file_refs
 
@@ -284,9 +377,15 @@ def _cmi_to_grayscale(cmi_values: np.ndarray, fill_value: float | None) -> tuple
         valid_mask &= values != float(fill_value)
 
     clipped = np.clip(values, TEMP_COLD_K, TEMP_WARM_K)
-    normalized = (TEMP_WARM_K - clipped) / (TEMP_WARM_K - TEMP_COLD_K)
-    gray = np.where(valid_mask, np.clip(normalized * 255.0, 0, 255), 0).astype(np.uint8)
-    alpha = np.where(valid_mask, 255, 0).astype(np.uint8)
+
+    # Focus the overlay on colder, denser cloud tops instead of rendering the full
+    # brightness-temperature field as an opaque gray veil.
+    visible_range = max(TEMP_VISIBLE_CLOUD_K - TEMP_DENSE_CLOUD_K, 1.0)
+    cloud_focus = np.clip((TEMP_VISIBLE_CLOUD_K - clipped) / visible_range, 0.0, 1.0)
+    brightness = np.power(cloud_focus, 0.85)
+
+    gray = np.where(valid_mask, np.clip(80.0 + brightness * 175.0, 0, 255), 0).astype(np.uint8)
+    alpha = np.where(valid_mask, np.clip(np.power(cloud_focus, 1.35) * 255.0, 0, 255), 0).astype(np.uint8)
     return gray, alpha
 
 
@@ -299,8 +398,8 @@ def tile_png_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path
 
 
 def _validate_tile_xyz(z: int, x: int, y: int) -> None:
-    if z < 0 or z > MAX_ZOOM:
-        raise CMIInvalidTileError(f"Unsupported zoom level {z}. Max zoom is {MAX_ZOOM}.")
+    if z != NATIVE_ZOOM:
+        raise CMIInvalidTileError(f"Unsupported zoom level {z}. Only zoom {NATIVE_ZOOM} is available.")
     limit = 1 << z
     if not (0 <= x < limit and 0 <= y < limit):
         raise CMIInvalidTileError(f"Tile coordinates out of range for zoom {z}: x={x}, y={y}")
@@ -409,21 +508,24 @@ def render_tile(frame: CMIFrame, z: int, x: int, y: int) -> Path:
                 dst_transform=tile_transform,
                 dst_crs="EPSG:3857",
                 dst_nodata=0,
-                resampling=Resampling.nearest,
+                resampling=Resampling.bilinear,
             )
 
+        alpha[alpha < 8] = 0
         rgba = np.stack((gray, gray, gray, gray), axis=0).astype(np.uint8)
         rgba[3] = alpha
-        with rasterio.open(
-            tile_path,
-            "w",
-            driver="PNG",
-            width=TILE_SIZE,
-            height=TILE_SIZE,
-            count=4,
-            dtype="uint8",
-        ) as dst:
-            dst.write(rgba)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
+            with rasterio.open(
+                tile_path,
+                "w",
+                driver="PNG",
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                count=4,
+                dtype="uint8",
+            ) as dst:
+                dst.write(rgba)
         return tile_path
 
 
@@ -432,21 +534,32 @@ def prepare_frame(frame: CMIFrame) -> CMIFrame:
         return frame
 
     build_frame_raster(frame)
-    for z in range(MAX_ZOOM + 1):
-        limit = 1 << z
-        for x in range(limit):
-            for y in range(limit):
-                render_tile(frame, z=z, x=x, y=y)
-
     return store_prepared_frame(frame)
+
+
+def prepare_frame_with_tracking(frame: CMIFrame) -> CMIFrame:
+    entry, is_owner = _begin_frame_warmup(frame)
+    if not is_owner:
+        return wait_for_frame_warmup(frame.satellite, frame.frame_id)
+
+    try:
+        prepared = prepare_frame(frame)
+    except Exception as exc:
+        _finish_frame_warmup(entry, error=exc)
+        raise
+
+    _finish_frame_warmup(entry)
+    return prepared
 
 
 def get_prepared_tile_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path:
     _validate_tile_xyz(z=z, x=x, y=y)
     tile_path = tile_png_path(satellite, frame_id, z, x, y)
-    if not tile_path.exists():
-        raise CMIFrameNotFoundError(f"Frame not found for {satellite}: {frame_id}")
-    return tile_path
+    if tile_path.exists():
+        return tile_path
+
+    frame = get_frame(satellite=satellite, frame_id=frame_id)
+    return render_tile(frame=frame, z=z, x=x, y=y)
 
 
 def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> None:
@@ -473,7 +586,7 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
 def _prepare_latest_frame(satellite: str) -> None:
     frames = discover_recent_frames(satellite)
     if frames:
-        prepare_frame(frames[0])
+        prepare_frame_with_tracking(frames[0])
 
 
 def _poll_once() -> None:
@@ -483,7 +596,7 @@ def _poll_once() -> None:
             for frame in reversed(frames[:FRAME_RETENTION_COUNT]):
                 if has_frame(frame.satellite, frame.frame_id):
                     continue
-                prepare_frame(frame)
+                prepare_frame_with_tracking(frame)
         except CMIFetchError:
             logger.exception("Failed to refresh latest CMI frames for %s", satellite)
         except Exception:
@@ -497,20 +610,27 @@ def _poll_loop() -> None:
         _poller_stop_event.wait(POLL_INTERVAL_SECONDS)
 
 
+def _warm_latest_then_poll_loop() -> None:
+    for satellite in SATELLITE_TO_ID:
+        if _poller_stop_event.is_set():
+            return
+        try:
+            _prepare_latest_frame(satellite)
+        except CMIFetchError:
+            logger.exception("Failed to warm latest CMI frame for %s", satellite)
+        except Exception:
+            logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
+
+    _poll_loop()
+
+
 def start_background_refresh() -> None:
     global _poller_thread
     with _poller_lock:
         if _poller_thread is not None and _poller_thread.is_alive():
             return
         _poller_stop_event.clear()
-        for satellite in SATELLITE_TO_ID:
-            try:
-                _prepare_latest_frame(satellite)
-            except CMIFetchError:
-                logger.exception("Failed to warm latest CMI frame for %s", satellite)
-            except Exception:
-                logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
-        _poller_thread = Thread(target=_poll_loop, name="cmi-refresh-poller", daemon=True)
+        _poller_thread = Thread(target=_warm_latest_then_poll_loop, name="cmi-refresh-poller", daemon=True)
         _poller_thread.start()
 
 

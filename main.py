@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from cmi.service import (
     FRAMES_CACHE_TTL_SECONDS,
     MAX_ZOOM,
+    NATIVE_ZOOM,
     POLL_INTERVAL_HINT_SECONDS,
     CMIFetchError,
     CMIFrameNotFoundError,
@@ -197,8 +198,8 @@ def cmi_ch13_tile(
     x: int,
     y: int,
 ) -> FileResponse:
-    if z > MAX_ZOOM:
-        raise HTTPException(status_code=422, detail=f"Unsupported zoom level {z}; max is {MAX_ZOOM}.")
+    if z != NATIVE_ZOOM:
+        raise HTTPException(status_code=422, detail=f"Unsupported zoom level {z}; only zoom {NATIVE_ZOOM} is available.")
 
     try:
         tile_path = get_tile_path(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
