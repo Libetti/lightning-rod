@@ -34,11 +34,14 @@ SATELLITE_TO_ID = {
     "goes-west": 18,
 }
 POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "30"))
-MAX_ZOOM = 8
+NATIVE_ZOOM = int(os.getenv("CMI_NATIVE_ZOOM", "2"))
+MAX_ZOOM = NATIVE_ZOOM
 FRAME_LOOKBACK = "4h"
 TILE_SIZE = 256
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
+TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
+TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
 FRAME_RETENTION_SECONDS = 2 * 60 * 60
 
 CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
@@ -374,9 +377,15 @@ def _cmi_to_grayscale(cmi_values: np.ndarray, fill_value: float | None) -> tuple
         valid_mask &= values != float(fill_value)
 
     clipped = np.clip(values, TEMP_COLD_K, TEMP_WARM_K)
-    normalized = (TEMP_WARM_K - clipped) / (TEMP_WARM_K - TEMP_COLD_K)
-    gray = np.where(valid_mask, np.clip(normalized * 255.0, 0, 255), 0).astype(np.uint8)
-    alpha = np.where(valid_mask, 255, 0).astype(np.uint8)
+
+    # Focus the overlay on colder, denser cloud tops instead of rendering the full
+    # brightness-temperature field as an opaque gray veil.
+    visible_range = max(TEMP_VISIBLE_CLOUD_K - TEMP_DENSE_CLOUD_K, 1.0)
+    cloud_focus = np.clip((TEMP_VISIBLE_CLOUD_K - clipped) / visible_range, 0.0, 1.0)
+    brightness = np.power(cloud_focus, 0.85)
+
+    gray = np.where(valid_mask, np.clip(80.0 + brightness * 175.0, 0, 255), 0).astype(np.uint8)
+    alpha = np.where(valid_mask, np.clip(np.power(cloud_focus, 1.35) * 255.0, 0, 255), 0).astype(np.uint8)
     return gray, alpha
 
 
@@ -389,8 +398,8 @@ def tile_png_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path
 
 
 def _validate_tile_xyz(z: int, x: int, y: int) -> None:
-    if z < 0 or z > MAX_ZOOM:
-        raise CMIInvalidTileError(f"Unsupported zoom level {z}. Max zoom is {MAX_ZOOM}.")
+    if z != NATIVE_ZOOM:
+        raise CMIInvalidTileError(f"Unsupported zoom level {z}. Only zoom {NATIVE_ZOOM} is available.")
     limit = 1 << z
     if not (0 <= x < limit and 0 <= y < limit):
         raise CMIInvalidTileError(f"Tile coordinates out of range for zoom {z}: x={x}, y={y}")
@@ -499,9 +508,10 @@ def render_tile(frame: CMIFrame, z: int, x: int, y: int) -> Path:
                 dst_transform=tile_transform,
                 dst_crs="EPSG:3857",
                 dst_nodata=0,
-                resampling=Resampling.nearest,
+                resampling=Resampling.bilinear,
             )
 
+        alpha[alpha < 8] = 0
         rgba = np.stack((gray, gray, gray, gray), axis=0).astype(np.uint8)
         rgba[3] = alpha
         with warnings.catch_warnings():

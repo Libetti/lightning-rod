@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from starlette.requests import Request
 
 import main
-from cmi.service import CMIFrame, FRAMES_CACHE_TTL_SECONDS
+from cmi.service import CMIFrame, FRAMES_CACHE_TTL_SECONDS, NATIVE_ZOOM
 from glm.service import FlashEvent, GLMFrame, GLMFetchError, RECENT_CACHE_TTL_SECONDS
 
 
@@ -157,7 +157,7 @@ class MainCMIEndpointTests(unittest.TestCase):
 
     def test_tile_endpoint_rejects_zoom_above_max(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
-            main.cmi_ch13_tile(satellite="goes-east", frame_id="abc", z=9, x=0, y=0)
+            main.cmi_ch13_tile(satellite="goes-east", frame_id="abc", z=NATIVE_ZOOM + 1, x=0, y=0)
         self.assertEqual(ctx.exception.status_code, 422)
 
     def test_tile_endpoint_serves_png_and_long_cache(self) -> None:
@@ -173,7 +173,7 @@ class MainCMIEndpointTests(unittest.TestCase):
                 response = main.cmi_ch13_tile(
                     satellite="goes-east",
                     frame_id="frame-id",
-                    z=2,
+                    z=NATIVE_ZOOM,
                     x=1,
                     y=1,
                 )

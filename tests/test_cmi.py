@@ -42,6 +42,33 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(frames[0].satellite, "goes-east")
         self.assertGreater(frames[0].start_time, frames[1].start_time)
 
+    def test_store_keeps_recent_frames_sorted_by_frame_time_after_backfill(self) -> None:
+        from cmi import store
+
+        newest = cmi.CMIFrame(
+            frame_id="frame-newest",
+            satellite="goes-east",
+            start_time="2026-04-06T10:10:00Z",
+            end_time="2026-04-06T10:19:59Z",
+            file_ref="s3://noaa-goes19/path/frame-newest.nc",
+        )
+        older = cmi.CMIFrame(
+            frame_id="frame-older",
+            satellite="goes-east",
+            start_time="2026-04-06T10:00:00Z",
+            end_time="2026-04-06T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-older.nc",
+        )
+
+        store.store_prepared_frame(newest)
+        store.store_prepared_frame(older)
+
+        frames = store.get_recent_frames("goes-east", limit=2)
+        latest, _ = store.get_latest_frame("goes-east")
+
+        self.assertEqual([frame.frame_id for frame in frames], ["frame-newest", "frame-older"])
+        self.assertEqual(latest.frame_id, "frame-newest")
+
     def test_cleanup_stale_cache_removes_old_files_and_keeps_new_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -77,7 +104,7 @@ class CMIUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             tile_dir = root / "tiles"
-            tile_path = tile_dir / "goes-east" / "frame-1" / "2" / "1" / "3.png"
+            tile_path = tile_dir / "goes-east" / "frame-1" / str(cmi.NATIVE_ZOOM) / "1" / "3.png"
             tile_path.parent.mkdir(parents=True, exist_ok=True)
             tile_path.write_bytes(b"\x89PNG\r\n\x1a\n")
 
@@ -91,9 +118,19 @@ class CMIUnitTests(unittest.TestCase):
                     end_time="2026-03-16T10:09:59Z",
                     file_ref="s3://noaa-goes19/path/frame-1.nc",
                 )
-                resolved = cmi.render_tile(frame=frame, z=2, x=1, y=3)
+                resolved = cmi.render_tile(frame=frame, z=cmi.NATIVE_ZOOM, x=1, y=3)
 
             self.assertEqual(resolved, tile_path)
+
+    def test_cmi_to_grayscale_masks_warm_background_and_emphasizes_cold_clouds(self) -> None:
+        values = np.array([[280.0, 252.0, 225.0]], dtype=np.float32)
+
+        gray, alpha = cmi._cmi_to_grayscale(values, fill_value=None)
+
+        self.assertEqual(int(alpha[0, 0]), 0)
+        self.assertGreater(int(alpha[0, 1]), 0)
+        self.assertGreater(int(alpha[0, 2]), int(alpha[0, 1]))
+        self.assertGreater(int(gray[0, 2]), int(gray[0, 1]))
 
     def test_prepare_frame_publishes_after_raster_build(self) -> None:
         frame = cmi.CMIFrame(
@@ -130,10 +167,20 @@ class CMIUnitTests(unittest.TestCase):
 
         tile_path = Path("/tmp/frame-1.png")
         with patch.object(cmi, "render_tile", return_value=tile_path) as render_mock:
-            resolved = cmi.get_prepared_tile_path(satellite="goes-east", frame_id="frame-1", z=2, x=1, y=3)
+            resolved = cmi.get_prepared_tile_path(
+                satellite="goes-east",
+                frame_id="frame-1",
+                z=cmi.NATIVE_ZOOM,
+                x=1,
+                y=3,
+            )
 
         self.assertEqual(resolved, tile_path)
-        render_mock.assert_called_once_with(frame=frame, z=2, x=1, y=3)
+        render_mock.assert_called_once_with(frame=frame, z=cmi.NATIVE_ZOOM, x=1, y=3)
+
+    def test_validate_tile_xyz_rejects_non_native_zoom(self) -> None:
+        with self.assertRaises(cmi.CMIInvalidTileError):
+            cmi._validate_tile_xyz(z=cmi.NATIVE_ZOOM + 1, x=0, y=0)
 
     def test_start_background_refresh_starts_poller_without_blocking_warmup(self) -> None:
         created_threads: list[object] = []
@@ -250,13 +297,16 @@ class CMIUnitTests(unittest.TestCase):
             bilinear = object()
             nearest = object()
 
+        reproject_resampling: list[object] = []
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             raster_path = root / "frame.tif"
             tile_dir = root / "tiles"
-            tile_path = tile_dir / "goes-east" / "frame-1" / "0" / "0" / "0.png"
+            tile_path = tile_dir / "goes-east" / "frame-1" / str(cmi.NATIVE_ZOOM) / "0" / "0.png"
 
             def _fake_reproject(*args, **kwargs) -> None:
+                reproject_resampling.append(kwargs["resampling"])
                 destination = kwargs["destination"]
                 destination[:] = 255
 
@@ -272,9 +322,10 @@ class CMIUnitTests(unittest.TestCase):
                 }):
                     with warnings.catch_warnings():
                         warnings.simplefilter("error", _FakeWarning)
-                        resolved = cmi.render_tile(frame=frame, z=0, x=0, y=0)
+                        resolved = cmi.render_tile(frame=frame, z=cmi.NATIVE_ZOOM, x=0, y=0)
 
         self.assertEqual(resolved, tile_path)
+        self.assertEqual(reproject_resampling, [_FakeResampling.bilinear, _FakeResampling.bilinear])
 
     def test_prepare_frame_with_tracking_collapses_concurrent_work(self) -> None:
         frame = cmi.CMIFrame(

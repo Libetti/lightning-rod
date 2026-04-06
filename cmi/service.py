@@ -10,6 +10,7 @@ CMIFrameNotFoundError = store.CMIFrameNotFoundError
 CMIInvalidTileError = store.CMIInvalidTileError
 FRAMES_CACHE_TTL_SECONDS = store.FRAMES_CACHE_TTL_SECONDS
 POLL_INTERVAL_HINT_SECONDS = store.POLL_INTERVAL_HINT_SECONDS
+NATIVE_ZOOM = ingest.NATIVE_ZOOM
 MAX_ZOOM = ingest.MAX_ZOOM
 _latest_by_satellite = store._latest_by_satellite
 _frames_by_satellite = store._frames_by_satellite

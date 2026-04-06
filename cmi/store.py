@@ -50,21 +50,30 @@ def store_prepared_frame(frame: CMIFrame) -> CMIFrame:
         updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     )
     with _store_lock:
-        frames = _frames_by_satellite.setdefault(frame.satellite, deque(maxlen=FRAME_RETENTION_COUNT))
-        frames.appendleft(entry)
-        deduped = deque(maxlen=FRAME_RETENTION_COUNT)
+        frames = list(_frames_by_satellite.get(frame.satellite, ()))
+        frames.insert(0, entry)
+
+        deduped_entries: list[_FrameStoreEntry] = []
         seen: set[str] = set()
         for item in frames:
             frame_id = item.frame.frame_id
             if frame_id in seen:
                 continue
-            deduped.append(item)
+            deduped_entries.append(item)
             seen.add(frame_id)
+
+        deduped_entries.sort(
+            key=lambda item: (item.frame.start_time, item.frame.end_time, item.frame.frame_id),
+            reverse=True,
+        )
+        retained = deduped_entries[:FRAME_RETENTION_COUNT]
+        deduped = deque(retained, maxlen=FRAME_RETENTION_COUNT)
+
         _frames_by_satellite[frame.satellite] = deduped
-        _latest_by_satellite[frame.satellite] = entry
+        _latest_by_satellite[frame.satellite] = deduped[0]
         _frame_index[(frame.satellite, frame.frame_id)] = entry
 
-        retained_ids = {item.frame.frame_id for item in deduped}
+        retained_ids = {item.frame.frame_id for item in retained}
         stale_keys = [
             key for key in _frame_index
             if key[0] == frame.satellite and key[1] not in retained_ids
