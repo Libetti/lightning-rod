@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from threading import Lock
 
 RECENT_CACHE_TTL_SECONDS = 10
@@ -48,7 +48,7 @@ def _store_entry(frame: GLMFrame, events: list[FlashEvent]) -> _FrameStoreEntry:
     return _FrameStoreEntry(
         frame=frame,
         events=[replace(event) for event in events],
-        updated_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     )
 
 
@@ -100,4 +100,3 @@ def get_latest_points(satellite: str, limit: int | None = None) -> tuple[GLMFram
         if entry is None:
             raise GLMFetchError(f"No cached lightning frame available yet for {satellite}.")
         return _entry_copy(entry, limit=limit)
-

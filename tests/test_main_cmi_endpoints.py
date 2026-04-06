@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse
 from starlette.requests import Request
 
 import main
-from app.cmi import CMIFrame, FRAMES_CACHE_TTL_SECONDS
-from app.glm import FlashEvent, GLMFrame, GLMFetchError, RECENT_CACHE_TTL_SECONDS
+from cmi.service import CMIFrame, FRAMES_CACHE_TTL_SECONDS
+from glm.service import FlashEvent, GLMFrame, GLMFetchError, RECENT_CACHE_TTL_SECONDS
 
 
 def _request(base_url: str = "http://testserver/") -> Request:
@@ -98,7 +98,7 @@ class MainCMIEndpointTests(unittest.TestCase):
         ]
 
         response = Response()
-        with patch.object(main, "fetch_recent_cmi_frames", return_value=mock_frames):
+        with patch.object(main, "get_recent_frames", return_value=mock_frames):
             payload = main.cmi_ch13_frames(
                 request=_request(),
                 response=response,
@@ -118,7 +118,7 @@ class MainCMIEndpointTests(unittest.TestCase):
         response = Response()
         with patch.object(
             main,
-            "fetch_recent_cmi_frames",
+            "get_recent_frames",
             return_value=[
                 CMIFrame(
                     frame_id="west-frame",
@@ -140,6 +140,21 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertEqual(payload.satellite, "goes-west")
         self.assertEqual(payload.count, 1)
 
+    def test_frames_endpoint_returns_503_without_cache(self) -> None:
+        response = Response()
+
+        with patch.object(main, "get_recent_frames", side_effect=main.CMIFetchError("No cached CMI frame available yet.")):
+            with self.assertRaises(HTTPException) as ctx:
+                main.cmi_ch13_frames(
+                    request=_request(),
+                    response=response,
+                    satellite="goes-east",
+                    limit=2,
+                    poll_hint=10,
+                )
+
+        self.assertEqual(ctx.exception.status_code, 502)
+
     def test_tile_endpoint_rejects_zoom_above_max(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
             main.cmi_ch13_tile(satellite="goes-east", frame_id="abc", z=9, x=0, y=0)
@@ -154,7 +169,7 @@ class MainCMIEndpointTests(unittest.TestCase):
                 b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01\xf6\x178U"
                 b"\x00\x00\x00\x00IEND\xaeB`\x82"
             )
-            with patch.object(main, "render_tile", return_value=png_path):
+            with patch.object(main, "get_tile_path", return_value=png_path):
                 response = main.cmi_ch13_tile(
                     satellite="goes-east",
                     frame_id="frame-id",
@@ -166,6 +181,27 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertIsInstance(response, FileResponse)
         self.assertEqual(response.media_type, "image/png")
         self.assertEqual(response.headers["Cache-Control"], "public, max-age=31536000, immutable")
+
+    def test_startup_and_shutdown_wire_both_services(self) -> None:
+        with patch.object(main, "start_glm_background_refresh") as start_glm, patch.object(
+            main, "start_cmi_background_refresh"
+        ) as start_cmi:
+            import asyncio
+
+            asyncio.run(main.startup())
+
+        start_glm.assert_called_once_with()
+        start_cmi.assert_called_once_with()
+
+        with patch.object(main, "stop_glm_background_refresh") as stop_glm, patch.object(
+            main, "stop_cmi_background_refresh"
+        ) as stop_cmi:
+            import asyncio
+
+            asyncio.run(main.shutdown())
+
+        stop_glm.assert_called_once_with()
+        stop_cmi.assert_called_once_with()
 
 
 if __name__ == "__main__":
