@@ -7,10 +7,12 @@ Tiny FastAPI server for exposing NOAA GOES data for:
 ## Files
 
 - `main.py`: Server app and API endpoints.
-- `app/glm.py`: thin facade for lightning ingest/store helpers used by the app.
-- `app/glm_ingest.py`: background NOAA fetch + GLM parse + polling loop.
-- `app/glm_store.py`: in-memory lightning frame/points store and read helpers.
-- `app/cmi.py`: NOAA fetch + CMI Ch13 frame discovery, raster prep, tile rendering, cache cleanup.
+- `glm/service.py`: thin facade for lightning ingest/store helpers used by the app.
+- `glm/ingest.py`: background NOAA fetch + GLM parse + polling loop.
+- `glm/store.py`: in-memory lightning frame/points store and read helpers.
+- `cmi/service.py`: thin facade for CMI frame/tile reads used by the app.
+- `cmi/ingest.py`: background NOAA fetch + CMI raster/tile preparation loop.
+- `cmi/store.py`: in-memory CMI frame index and retention helpers.
 - `requirements.txt`: runtime dependencies
 
 ## Run locally

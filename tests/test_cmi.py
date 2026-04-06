@@ -6,10 +6,18 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from app import cmi
+from cmi import ingest as cmi
 
 
 class CMIUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from cmi import store
+
+        store._latest_by_satellite.clear()
+        store._frames_by_satellite.clear()
+        store._frame_index.clear()
+        cmi._poller_stop_event.clear()
+
     def test_frames_from_file_refs_dedupes_and_sorts_newest_first(self) -> None:
         file_refs = [
             "s3://noaa-goes19/ABI-L2-CMIPF/2026/076/10/"
@@ -47,9 +55,7 @@ class CMIUnitTests(unittest.TestCase):
 
             with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(cmi, "RASTER_DIR", raster_dir), patch.object(
                 cmi, "TILE_DIR", tile_dir
-            ), patch.object(cmi, "CLEANUP_MIN_INTERVAL_SECONDS", 0), patch.object(cmi, "_last_cleanup_at", 0), patch.object(
-                cmi, "time", return_value=4000
-            ):
+            ), patch.object(cmi, "time", return_value=4000):
                 # force deterministic mtimes
                 os.utime(old_file, (old_epoch, old_epoch))
                 os.utime(fresh_file, (fresh_epoch, fresh_epoch))
@@ -69,11 +75,67 @@ class CMIUnitTests(unittest.TestCase):
             tile_path.write_bytes(b"\x89PNG\r\n\x1a\n")
 
             with patch.object(cmi, "TILE_DIR", tile_dir), patch.object(
-                cmi, "ensure_frame_raster", side_effect=AssertionError("should not render on cache hit")
+                cmi, "build_frame_raster", side_effect=AssertionError("should not render on cache hit")
             ):
-                resolved = cmi.render_tile(frame_id="frame-1", satellite="goes-east", z=2, x=1, y=3)
+                frame = cmi.CMIFrame(
+                    frame_id="frame-1",
+                    satellite="goes-east",
+                    start_time="2026-03-16T10:00:00Z",
+                    end_time="2026-03-16T10:09:59Z",
+                    file_ref="s3://noaa-goes19/path/frame-1.nc",
+                )
+                resolved = cmi.render_tile(frame=frame, z=2, x=1, y=3)
 
             self.assertEqual(resolved, tile_path)
+
+    def test_prepare_frame_publishes_only_after_success(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+
+        with patch.object(cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")), patch.object(
+            cmi, "render_tile", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                cmi.prepare_frame(frame)
+
+        from cmi import store
+
+        self.assertFalse(store.has_frame("goes-east", "frame-1"))
+
+    def test_start_background_refresh_warms_latest_frame(self) -> None:
+        frame = cmi.CMIFrame(
+            frame_id="frame-1",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-1.nc",
+        )
+
+        class _FakeThread:
+            def __init__(self, *args, **kwargs) -> None:
+                self.started = False
+
+            def is_alive(self) -> bool:
+                return self.started
+
+            def start(self) -> None:
+                self.started = True
+
+            def join(self, timeout: float | None = None) -> None:
+                self.started = False
+
+        with patch.object(cmi, "discover_recent_frames", side_effect=[[frame], []]), patch.object(
+            cmi, "prepare_frame", return_value=frame
+        ) as prepare_mock, patch.object(cmi, "Thread", _FakeThread):
+            cmi.start_background_refresh()
+            cmi.stop_background_refresh()
+
+        self.assertEqual(prepare_mock.call_count, 1)
 
 
 if __name__ == "__main__":

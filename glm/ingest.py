@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Event, Lock, Thread
@@ -12,7 +12,7 @@ from urllib.request import urlretrieve
 
 from netCDF4 import Dataset, num2date
 
-from app.glm_store import FlashEvent, GLMFetchError, GLMFrame, get_cached_frame_id, store_latest_points
+from glm.store import FlashEvent, GLMFetchError, GLMFrame, get_cached_frame_id, store_latest_points
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def _token_to_iso(token: str) -> str:
     raw = token[1:]
     base = raw[:13]
     fraction = raw[13:19].ljust(6, "0")
-    parsed = datetime.strptime(base, "%Y%j%H%M%S").replace(tzinfo=UTC)
+    parsed = datetime.strptime(base, "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
     parsed = parsed.replace(microsecond=int(fraction))
     return parsed.isoformat().replace("+00:00", "Z")
 
@@ -156,7 +156,7 @@ def parse_flashes_direct(nc_path: Path, limit: int | None = None) -> list[FlashE
         for i in range(size):
             time_value = times[i]
             if isinstance(time_value, datetime):
-                time_iso = time_value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                time_iso = time_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
             else:
                 time_iso = str(time_value)
 
@@ -234,4 +234,3 @@ def stop_background_refresh() -> None:
         _poller_stop_event.set()
         thread.join(timeout=1.0)
         _poller_thread = None
-

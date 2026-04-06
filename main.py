@@ -7,23 +7,25 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app.cmi import (
+from cmi.service import (
     FRAMES_CACHE_TTL_SECONDS,
     MAX_ZOOM,
     POLL_INTERVAL_HINT_SECONDS,
     CMIFetchError,
     CMIFrameNotFoundError,
     CMIInvalidTileError,
-    fetch_recent_cmi_frames,
-    render_tile,
+    get_recent_frames,
+    get_tile_path,
+    start_background_refresh as start_cmi_background_refresh,
+    stop_background_refresh as stop_cmi_background_refresh,
 )
-from app.glm import (
+from glm.service import (
     GLMFetchError,
     RECENT_CACHE_TTL_SECONDS,
     get_latest_frame,
     get_latest_points,
-    start_background_refresh,
-    stop_background_refresh,
+    start_background_refresh as start_glm_background_refresh,
+    stop_background_refresh as stop_glm_background_refresh,
 )
 from app.runtime_diagnostics import (
     install_asyncio_exception_handler,
@@ -86,12 +88,14 @@ class CMIFramesResponse(BaseModel):
 @app.on_event("startup")
 async def startup() -> None:
     install_asyncio_exception_handler()
-    start_background_refresh()
+    start_glm_background_refresh()
+    start_cmi_background_refresh()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    stop_background_refresh()
+    stop_glm_background_refresh()
+    stop_cmi_background_refresh()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -151,7 +155,7 @@ def cmi_ch13_frames(
     poll_hint: int = Query(default=POLL_INTERVAL_HINT_SECONDS, ge=1, le=60),
 ) -> CMIFramesResponse:
     try:
-        frames = fetch_recent_cmi_frames(satellite=satellite, limit=limit)
+        frames = get_recent_frames(satellite=satellite, limit=limit)
     except CMIFetchError as exc:
         logger.exception(
             "CMI frames request failed: satellite=%s limit=%s poll_hint=%s",
@@ -197,7 +201,7 @@ def cmi_ch13_tile(
         raise HTTPException(status_code=422, detail=f"Unsupported zoom level {z}; max is {MAX_ZOOM}.")
 
     try:
-        tile_path = render_tile(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
+        tile_path = get_tile_path(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
     except CMIFrameNotFoundError as exc:
         logger.warning(
             "CMI tile request referenced unknown frame: satellite=%s frame_id=%s z=%s x=%s y=%s",
