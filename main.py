@@ -5,18 +5,15 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from cmi.service import (
     FRAMES_CACHE_TTL_SECONDS,
-    MAX_ZOOM,
-    NATIVE_ZOOM,
     POLL_INTERVAL_HINT_SECONDS,
     CMIFetchError,
     CMIFrameNotFoundError,
-    CMIInvalidTileError,
+    get_image_artifacts,
     get_recent_frames,
-    get_tile_path,
     start_background_refresh as start_cmi_background_refresh,
     stop_background_refresh as stop_cmi_background_refresh,
 )
@@ -76,7 +73,12 @@ class CMIFrameModel(BaseModel):
     satellite: str
     start_time: str
     end_time: str
-    tile_url_template: str
+    image_url: str
+    coordinates: list[tuple[float, float]] = Field(
+        min_length=4,
+        max_length=4,
+        description="ImageSource corners ordered top-left, top-right, bottom-right, bottom-left.",
+    )
 
 
 class CMIFramesResponse(BaseModel):
@@ -167,17 +169,14 @@ def cmi_ch13_frames(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     base_url = str(request.base_url).rstrip("/")
-    tile_template = (
-        f"{base_url}/imagery/cmi/ch13/tiles/{satellite}/"
-        "{frame_id}/{z}/{x}/{y}.png"
-    )
     frame_models = [
         CMIFrameModel(
             frame_id=frame.frame_id,
             satellite=frame.satellite,
             start_time=frame.start_time,
             end_time=frame.end_time,
-            tile_url_template=tile_template.replace("{frame_id}", frame.frame_id),
+            image_url=f"{base_url}/imagery/cmi/ch13/images/{frame.satellite}/{frame.frame_id}.png",
+            coordinates=get_image_artifacts(frame_id=frame.frame_id, satellite=frame.satellite)[1],
         )
         for frame in frames
     ]
@@ -190,52 +189,39 @@ def cmi_ch13_frames(
     )
 
 
-@app.get("/imagery/cmi/ch13/tiles/{satellite}/{frame_id}/{z}/{x}/{y}.png")
-def cmi_ch13_tile(
+@app.get(
+    "/imagery/cmi/ch13/images/{satellite}/{frame_id}.png",
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "PNG image for the requested CMI frame.",
+            "content": {"image/png": {}},
+        }
+    },
+)
+def cmi_ch13_image(
     satellite: Literal["goes-east", "goes-west"],
     frame_id: str,
-    z: int,
-    x: int,
-    y: int,
 ) -> FileResponse:
-    if z != NATIVE_ZOOM:
-        raise HTTPException(status_code=422, detail=f"Unsupported zoom level {z}; only zoom {NATIVE_ZOOM} is available.")
-
     try:
-        tile_path = get_tile_path(frame_id=frame_id, satellite=satellite, z=z, x=x, y=y)
+        image_path, _ = get_image_artifacts(frame_id=frame_id, satellite=satellite)
     except CMIFrameNotFoundError as exc:
         logger.warning(
-            "CMI tile request referenced unknown frame: satellite=%s frame_id=%s z=%s x=%s y=%s",
+            "CMI image request referenced unknown frame: satellite=%s frame_id=%s",
             satellite,
             frame_id,
-            z,
-            x,
-            y,
         )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CMIInvalidTileError as exc:
-        logger.warning(
-            "CMI tile request used invalid tile coordinates: satellite=%s frame_id=%s z=%s x=%s y=%s",
-            satellite,
-            frame_id,
-            z,
-            x,
-            y,
-        )
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except CMIFetchError as exc:
         logger.exception(
-            "CMI tile request failed: satellite=%s frame_id=%s z=%s x=%s y=%s",
+            "CMI image request failed: satellite=%s frame_id=%s",
             satellite,
             frame_id,
-            z,
-            x,
-            y,
         )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return FileResponse(
-        path=tile_path,
+        path=image_path,
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )

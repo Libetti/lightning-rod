@@ -2,7 +2,7 @@
 
 Tiny FastAPI server for exposing NOAA GOES data for:
 - Latest GLM lightning frame metadata and points as JSON.
-- GOES ABI CMI Channel 13 (Clean IR) frame metadata and XYZ tiles for MapLibre.
+- GOES ABI CMI Channel 13 (Clean IR) frame metadata and globe-ready frame images for MapLibre.
 
 ## Files
 
@@ -10,8 +10,8 @@ Tiny FastAPI server for exposing NOAA GOES data for:
 - `glm/service.py`: thin facade for lightning ingest/store helpers used by the app.
 - `glm/ingest.py`: background NOAA fetch + GLM parse + polling loop.
 - `glm/store.py`: in-memory lightning frame/points store and read helpers.
-- `cmi/service.py`: thin facade for CMI frame/tile reads used by the app.
-- `cmi/ingest.py`: background NOAA fetch + CMI raster/tile preparation loop.
+- `cmi/service.py`: thin facade for CMI frame/image reads used by the app.
+- `cmi/ingest.py`: background NOAA fetch + CMI raster/image preparation loop.
 - `cmi/store.py`: in-memory CMI frame index and retention helpers.
 - `requirements.txt`: runtime dependencies
 
@@ -42,7 +42,7 @@ Tiny FastAPI server for exposing NOAA GOES data for:
    - Latest lightning frame: `http://127.0.0.1:8000/lightning/latest-frame`
    - Latest lightning points: `http://127.0.0.1:8000/lightning/latest-points?satellite=goes-west&limit=1000`
    - CMI Ch13 frame list: `http://127.0.0.1:8000/imagery/cmi/ch13/frames?satellite=goes-east&limit=12`
-   - CMI Ch13 tile template (from frame list): `http://127.0.0.1:8000/imagery/cmi/ch13/tiles/{satellite}/{frame_id}/{z}/{x}/{y}.png`
+   - CMI Ch13 frame image: `http://127.0.0.1:8000/imagery/cmi/ch13/images/{satellite}/{frame_id}.png`
 
 ## Lightning Notes
 
@@ -104,5 +104,32 @@ Example `GET /lightning/latest-points` response:
 - Satellites supported: `goes-east`, `goes-west`
 - Coverage: full disk (`ABI-L2-CMIPF`, channel/band 13)
 - Polling: call `/imagery/cmi/ch13/frames` every ~10 seconds; advance animation only when a new `frame_id` appears
-- Tile zoom range: `z0-z8`
-- Tile cache: on-demand render and disk cache under temp dir (`/tmp/lightning_rod_cmi`), retained for ~2 hours
+- Frames include `image_url` plus exactly four `coordinates` in top-left, top-right, bottom-right, bottom-left order for a MapLibre `ImageSource`
+- `GET /imagery/cmi/ch13/images/{satellite}/{frame_id}.png` returns `image/png`
+- Image placement is a practical EPSG:4326 approximation for globe rendering, not a native GOES geostationary renderer
+- Image cache: on-demand render and disk cache under temp dir (`/tmp/lightning_rod_cmi`), retained for ~2 hours
+
+Example `GET /imagery/cmi/ch13/frames` response:
+
+```json
+{
+  "satellite": "goes-east",
+  "count": 1,
+  "poll_interval_seconds": 30,
+  "frames": [
+    {
+      "frame_id": "OR_ABI-L2-CMIPF-M6C13_G19_s20260942240173_e20260942249481_c20260942249529",
+      "satellite": "goes-east",
+      "start_time": "2026-04-03T22:40:17.300000Z",
+      "end_time": "2026-04-03T22:49:48.100000Z",
+      "image_url": "http://127.0.0.1:8000/imagery/cmi/ch13/images/goes-east/OR_ABI-L2-CMIPF-M6C13_G19_s20260942240173_e20260942249481_c20260942249529.png",
+      "coordinates": [
+        [-140.0, 55.0],
+        [-60.0, 55.0],
+        [-60.0, -10.0],
+        [-140.0, -10.0]
+      ]
+    }
+  ]
+}
+```

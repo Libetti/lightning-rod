@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import tempfile
-import unittest
 import os
+import tempfile
 import threading
+import unittest
 import warnings
 from pathlib import Path
 from unittest.mock import patch
@@ -31,7 +31,6 @@ class CMIUnitTests(unittest.TestCase):
             "OR_ABI-L2-CMIPF-M6C13_G19_s20260761000101_e20260761009409_c20260761010155.nc",
             "s3://noaa-goes19/ABI-L2-CMIPF/2026/076/09/"
             "OR_ABI-L2-CMIPF-M6C13_G19_s20260760950101_e20260760959409_c20260761000155.nc",
-            # duplicate frame id via alternate path format
             "noaa-goes19/ABI-L2-CMIPF/2026/076/10/"
             "OR_ABI-L2-CMIPF-M6C13_G19_s20260761000101_e20260761009409_c20260761010155.nc",
         ]
@@ -74,13 +73,15 @@ class CMIUnitTests(unittest.TestCase):
             root = Path(tmp_dir)
             source_dir = root / "source"
             raster_dir = root / "rasters"
-            tile_dir = root / "tiles"
+            image_dir = root / "images"
+            metadata_dir = root / "metadata"
             source_dir.mkdir(parents=True)
             raster_dir.mkdir(parents=True)
-            tile_dir.mkdir(parents=True)
+            image_dir.mkdir(parents=True)
+            metadata_dir.mkdir(parents=True)
 
             old_file = source_dir / "old.nc"
-            fresh_file = tile_dir / "fresh.png"
+            fresh_file = image_dir / "fresh.png"
             old_file.write_bytes(b"old")
             fresh_file.write_bytes(b"fresh")
 
@@ -88,27 +89,31 @@ class CMIUnitTests(unittest.TestCase):
             fresh_epoch = 3000
 
             with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(cmi, "RASTER_DIR", raster_dir), patch.object(
-                cmi, "TILE_DIR", tile_dir
-            ), patch.object(cmi, "time", return_value=4000):
-                # force deterministic mtimes
+                cmi, "IMAGE_DIR", image_dir
+            ), patch.object(cmi, "METADATA_DIR", metadata_dir), patch.object(cmi, "time", return_value=4000):
                 os.utime(old_file, (old_epoch, old_epoch))
                 os.utime(fresh_file, (fresh_epoch, fresh_epoch))
-
-                # use 1500s retention => cutoff=2500, so old is deleted and fresh remains
                 cmi.cleanup_stale_cache(retention_seconds=1500)
 
             self.assertFalse(old_file.exists())
             self.assertTrue(fresh_file.exists())
 
-    def test_render_tile_returns_cached_file_without_rendering(self) -> None:
+    def test_render_frame_image_returns_cached_file_without_rendering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            tile_dir = root / "tiles"
-            tile_path = tile_dir / "goes-east" / "frame-1" / str(cmi.NATIVE_ZOOM) / "1" / "3.png"
-            tile_path.parent.mkdir(parents=True, exist_ok=True)
-            tile_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            image_dir = root / "images"
+            metadata_dir = root / "metadata"
+            image_path = image_dir / "goes-east" / "frame-1.png"
+            metadata_path = metadata_dir / "goes-east" / "frame-1.json"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            metadata_path.write_text(
+                '{"coordinates": [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]}',
+                encoding="utf-8",
+            )
 
-            with patch.object(cmi, "TILE_DIR", tile_dir), patch.object(
+            with patch.object(cmi, "IMAGE_DIR", image_dir), patch.object(cmi, "METADATA_DIR", metadata_dir), patch.object(
                 cmi, "build_frame_raster", side_effect=AssertionError("should not render on cache hit")
             ):
                 frame = cmi.CMIFrame(
@@ -118,9 +123,10 @@ class CMIUnitTests(unittest.TestCase):
                     end_time="2026-03-16T10:09:59Z",
                     file_ref="s3://noaa-goes19/path/frame-1.nc",
                 )
-                resolved = cmi.render_tile(frame=frame, z=cmi.NATIVE_ZOOM, x=1, y=3)
+                resolved, coordinates = cmi.render_frame_image(frame=frame)
 
-            self.assertEqual(resolved, tile_path)
+            self.assertEqual(resolved, image_path)
+            self.assertEqual(coordinates[0], [-140.0, 55.0])
 
     def test_cmi_to_grayscale_masks_warm_background_and_emphasizes_cold_clouds(self) -> None:
         values = np.array([[280.0, 252.0, 225.0]], dtype=np.float32)
@@ -132,7 +138,17 @@ class CMIUnitTests(unittest.TestCase):
         self.assertGreater(int(alpha[0, 2]), int(alpha[0, 1]))
         self.assertGreater(int(gray[0, 2]), int(gray[0, 1]))
 
-    def test_prepare_frame_publishes_after_raster_build(self) -> None:
+    def test_smooth_coverage_mask_softens_spikes(self) -> None:
+        coverage = np.zeros((7, 7), dtype=np.uint8)
+        coverage[:, 3] = 255
+
+        smoothed = cmi._smooth_coverage_mask(coverage, radius=1, passes=2)
+
+        self.assertLess(int(smoothed[3, 3]), 255)
+        self.assertGreater(int(smoothed[3, 2]), 0)
+        self.assertGreater(int(smoothed[3, 4]), 0)
+
+    def test_prepare_frame_publishes_after_image_build(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -141,9 +157,10 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
 
-        prepared = None
         with patch.object(cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")), patch.object(
-            cmi, "render_tile", side_effect=AssertionError("tiles should render lazily")
+            cmi,
+            "render_frame_image",
+            return_value=(Path("/tmp/frame-1.png"), [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]]),
         ):
             prepared = cmi.prepare_frame(frame)
 
@@ -152,7 +169,7 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(prepared, frame)
         self.assertTrue(store.has_frame("goes-east", "frame-1"))
 
-    def test_get_prepared_tile_path_renders_tile_on_demand(self) -> None:
+    def test_get_prepared_image_artifacts_renders_on_demand(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -165,22 +182,17 @@ class CMIUnitTests(unittest.TestCase):
 
         store.store_prepared_frame(frame)
 
-        tile_path = Path("/tmp/frame-1.png")
-        with patch.object(cmi, "render_tile", return_value=tile_path) as render_mock:
-            resolved = cmi.get_prepared_tile_path(
+        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
+        image_path = Path("/tmp/frame-1.png")
+        with patch.object(cmi, "render_frame_image", return_value=(image_path, coordinates)) as render_mock:
+            resolved, actual_coordinates = cmi.get_prepared_image_artifacts(
                 satellite="goes-east",
                 frame_id="frame-1",
-                z=cmi.NATIVE_ZOOM,
-                x=1,
-                y=3,
             )
 
-        self.assertEqual(resolved, tile_path)
-        render_mock.assert_called_once_with(frame=frame, z=cmi.NATIVE_ZOOM, x=1, y=3)
-
-    def test_validate_tile_xyz_rejects_non_native_zoom(self) -> None:
-        with self.assertRaises(cmi.CMIInvalidTileError):
-            cmi._validate_tile_xyz(z=cmi.NATIVE_ZOOM + 1, x=0, y=0)
+        self.assertEqual(resolved, image_path)
+        self.assertEqual(actual_coordinates, coordinates)
+        render_mock.assert_called_once_with(frame=frame)
 
     def test_start_background_refresh_starts_poller_without_blocking_warmup(self) -> None:
         created_threads: list[object] = []
@@ -231,7 +243,7 @@ class CMIUnitTests(unittest.TestCase):
 
         self.assertEqual(file_refs, [str(cached)])
 
-    def test_render_tile_ignores_not_georeferenced_warning_when_promoted_to_error(self) -> None:
+    def test_render_frame_image_ignores_not_georeferenced_warning_when_promoted_to_error(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -243,12 +255,27 @@ class CMIUnitTests(unittest.TestCase):
         class _FakeWarning(UserWarning):
             pass
 
-        class _FakeDataset:
+        class _FakeSourceDataset:
             def __init__(self) -> None:
                 self.transform = object()
                 self.crs = "EPSG:4326"
+                self.width = 2
+                self.height = 2
 
-            def __enter__(self) -> "_FakeDataset":
+            def __enter__(self) -> "_FakeSourceDataset":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self, index: int) -> np.ndarray:
+                if index == 3:
+                    return np.array([[255, 255], [255, 255]], dtype=np.uint8)
+                return np.array([[0, 128], [255, 255]], dtype=np.uint8)
+
+        class _FakePngDataset:
+            def __enter__(self) -> "_FakePngDataset":
+                warnings.warn("png profile warning", _FakeWarning)
                 return self
 
             def __exit__(self, exc_type, exc, tb) -> None:
@@ -257,77 +284,56 @@ class CMIUnitTests(unittest.TestCase):
             def write(self, rgba: np.ndarray) -> None:
                 self.rgba = rgba
 
-        class _FakePngDataset(_FakeDataset):
-            def __enter__(self) -> "_FakePngDataset":
-                warnings.warn("Dataset has no geotransform", _FakeWarning)
-                return self
+        class _FakeRasterioErrors:
+            NotGeoreferencedWarning = _FakeWarning
 
         class _FakeRasterio:
-            class errors:
-                NotGeoreferencedWarning = _FakeWarning
+            errors = _FakeRasterioErrors()
 
             @staticmethod
-            def open(*args, **kwargs):
-                if len(args) >= 2 and args[1] == "w":
-                    return _FakePngDataset()
-                return _FakeDataset()
-
-            @staticmethod
-            def band(src, index: int) -> tuple[object, int]:
+            def band(src: object, index: int) -> tuple[object, int]:
                 return (src, index)
 
-        class _FakeMercantile:
-            class Tile:
-                def __init__(self, x: int, y: int, z: int) -> None:
-                    self.x = x
-                    self.y = y
-                    self.z = z
-
             @staticmethod
-            def xy_bounds(tile: object):
-                class _Bounds:
-                    left = 0.0
-                    bottom = 0.0
-                    right = 1.0
-                    top = 1.0
+            def open(path: Path, mode: str = "r", **kwargs):
+                if mode == "w":
+                    return _FakePngDataset()
+                return _FakeSourceDataset()
 
-                return _Bounds()
-
-        class _FakeResampling:
-            bilinear = object()
-            nearest = object()
-
-        reproject_resampling: list[object] = []
+        def _fake_reproject(source, destination, **kwargs) -> None:
+            src, index = source
+            destination[:] = src.read(index)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            raster_path = root / "frame.tif"
-            tile_dir = root / "tiles"
-            tile_path = tile_dir / "goes-east" / "frame-1" / str(cmi.NATIVE_ZOOM) / "0" / "0.png"
+            image_dir = root / "images"
+            metadata_dir = root / "metadata"
+            image_path = image_dir / "goes-east" / "frame-1.png"
 
-            def _fake_reproject(*args, **kwargs) -> None:
-                reproject_resampling.append(kwargs["resampling"])
-                destination = kwargs["destination"]
-                destination[:] = 255
-
-            with patch.object(cmi, "TILE_DIR", tile_dir), patch.object(
-                cmi, "build_frame_raster", return_value=raster_path
+            with patch.object(cmi, "IMAGE_DIR", image_dir), patch.object(cmi, "METADATA_DIR", metadata_dir), patch.object(
+                cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")
             ), patch.object(
-                cmi, "_require_tile_dependencies", return_value=(_FakeMercantile(), _FakeRasterio())
+                cmi, "_require_rasterio", return_value=_FakeRasterio()
+            ), patch.object(
+                cmi,
+                "_frame_coordinates_from_source",
+                return_value=[[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]],
+            ), patch(
+                "rasterio.enums.Resampling"
+            ) as resampling_mock, patch(
+                "rasterio.transform.from_bounds", return_value="transform"
+            ), patch(
+                "rasterio.warp.reproject", side_effect=_fake_reproject
             ):
-                with patch.dict("sys.modules", {
-                    "rasterio.enums": type("_EnumsModule", (), {"Resampling": _FakeResampling})(),
-                    "rasterio.transform": type("_TransformModule", (), {"from_bounds": lambda *args, **kwargs: object()})(),
-                    "rasterio.warp": type("_WarpModule", (), {"reproject": _fake_reproject})(),
-                }):
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("error", _FakeWarning)
-                        resolved = cmi.render_tile(frame=frame, z=cmi.NATIVE_ZOOM, x=0, y=0)
+                resampling_mock.bilinear = "bilinear"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", _FakeWarning)
+                    resolved, coordinates = cmi.render_frame_image(frame=frame)
 
-        self.assertEqual(resolved, tile_path)
-        self.assertEqual(reproject_resampling, [_FakeResampling.bilinear, _FakeResampling.bilinear])
+        self.assertEqual(resolved, image_path)
+        self.assertEqual(coordinates[0], [-140.0, 55.0])
 
-    def test_prepare_frame_with_tracking_collapses_concurrent_work(self) -> None:
+    def test_prepare_frame_with_tracking_allows_single_owner(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -335,11 +341,11 @@ class CMIUnitTests(unittest.TestCase):
             end_time="2026-03-16T10:09:59Z",
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
+        prepare_calls: list[str] = []
         start_gate = threading.Event()
         release_gate = threading.Event()
         results: list[cmi.CMIFrame] = []
-        errors: list[Exception] = []
-        prepare_calls: list[str] = []
+        errors: list[BaseException] = []
 
         def _fake_prepare(inner_frame: cmi.CMIFrame) -> cmi.CMIFrame:
             prepare_calls.append(inner_frame.frame_id)
@@ -347,15 +353,16 @@ class CMIUnitTests(unittest.TestCase):
             release_gate.wait(timeout=2.0)
             return inner_frame
 
-        def _run_worker() -> None:
+        def _run_prepare() -> None:
             try:
                 results.append(cmi.prepare_frame_with_tracking(frame))
-            except Exception as exc:
+            except BaseException as exc:  # pragma: no cover - test helper
                 errors.append(exc)
 
         with patch.object(cmi, "prepare_frame", side_effect=_fake_prepare):
-            owner = threading.Thread(target=_run_worker)
-            waiter = threading.Thread(target=_run_worker)
+            owner = threading.Thread(target=_run_prepare)
+            waiter = threading.Thread(target=_run_prepare)
+
             owner.start()
             start_gate.wait(timeout=2.0)
             waiter.start()
@@ -413,8 +420,9 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(frames, [frame])
         get_recent_mock.assert_called_once_with(satellite="goes-east", limit=12)
 
-    def test_service_get_tile_path_waits_for_in_progress_warmup(self) -> None:
-        tile_path = Path("/tmp/frame-1.png")
+    def test_service_get_image_artifacts_waits_for_in_progress_warmup(self) -> None:
+        image_path = Path("/tmp/frame-1.png")
+        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
 
         with patch.object(
             cmi_service.store, "get_frame", side_effect=cmi_service.CMIFrameNotFoundError("missing")
@@ -427,20 +435,19 @@ class CMIUnitTests(unittest.TestCase):
                 file_ref="s3://noaa-goes19/path/frame-1.nc",
             )
         ) as wait_mock, patch.object(
-            cmi_service.ingest, "get_prepared_tile_path",
-            side_effect=[cmi_service.CMIFrameNotFoundError("missing"), tile_path],
-        ) as get_tile_mock:
-            resolved = cmi_service.get_tile_path(
+            cmi_service.ingest,
+            "get_prepared_image_artifacts",
+            side_effect=[cmi_service.CMIFrameNotFoundError("missing"), (image_path, coordinates)],
+        ) as get_image_mock:
+            resolved, actual_coordinates = cmi_service.get_image_artifacts(
                 frame_id="frame-1",
                 satellite="goes-east",
-                z=2,
-                x=1,
-                y=1,
             )
 
-        self.assertEqual(resolved, tile_path)
+        self.assertEqual(resolved, image_path)
+        self.assertEqual(actual_coordinates, coordinates)
         self.assertEqual(wait_mock.call_count, 2)
-        self.assertEqual(get_tile_mock.call_count, 2)
+        self.assertEqual(get_image_mock.call_count, 2)
 
 
 if __name__ == "__main__":

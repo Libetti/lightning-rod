@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from starlette.requests import Request
 
 import main
-from cmi.service import CMIFrame, FRAMES_CACHE_TTL_SECONDS, NATIVE_ZOOM
+from cmi.service import CMIFrame, FRAMES_CACHE_TTL_SECONDS
 from glm.service import FlashEvent, GLMFrame, GLMFetchError, RECENT_CACHE_TTL_SECONDS
 
 
@@ -34,6 +34,18 @@ def _request(base_url: str = "http://testserver/") -> Request:
 
 
 class MainCMIEndpointTests(unittest.TestCase):
+    def test_openapi_documents_cmi_image_route_as_png(self) -> None:
+        schema = main.app.openapi()
+
+        image_route = schema["paths"]["/imagery/cmi/ch13/images/{satellite}/{frame_id}.png"]["get"]
+        frame_schema = schema["components"]["schemas"]["CMIFrameModel"]
+        coordinates_schema = frame_schema["properties"]["coordinates"]
+
+        self.assertIn("image/png", image_route["responses"]["200"]["content"])
+        self.assertEqual(coordinates_schema["minItems"], 4)
+        self.assertEqual(coordinates_schema["maxItems"], 4)
+        self.assertIn("top-left", coordinates_schema["description"])
+
     def test_lightning_latest_frame_returns_metadata(self) -> None:
         frame = GLMFrame(
             frame_id="glm-frame-1",
@@ -79,7 +91,7 @@ class MainCMIEndpointTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 503)
 
-    def test_frames_endpoint_returns_metadata(self) -> None:
+    def test_frames_endpoint_returns_image_metadata(self) -> None:
         mock_frames = [
             CMIFrame(
                 frame_id="frame-new",
@@ -96,9 +108,12 @@ class MainCMIEndpointTests(unittest.TestCase):
                 file_ref="s3://noaa-goes19/path/frame-old.nc",
             ),
         ]
+        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
 
         response = Response()
-        with patch.object(main, "get_recent_frames", return_value=mock_frames):
+        with patch.object(main, "get_recent_frames", return_value=mock_frames), patch.object(
+            main, "get_image_artifacts", return_value=(Path("/tmp/frame.png"), coordinates)
+        ) as image_mock:
             payload = main.cmi_ch13_frames(
                 request=_request(),
                 response=response,
@@ -111,11 +126,17 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertEqual(payload.count, 2)
         self.assertEqual(payload.poll_interval_seconds, 10)
         self.assertEqual(payload.frames[0].frame_id, "frame-new")
-        self.assertIn("/imagery/cmi/ch13/tiles/goes-east/frame-new/", payload.frames[0].tile_url_template)
+        self.assertEqual(
+            payload.frames[0].image_url,
+            "http://testserver/imagery/cmi/ch13/images/goes-east/frame-new.png",
+        )
+        self.assertEqual(payload.frames[0].coordinates, [tuple(point) for point in coordinates])
+        self.assertEqual(image_mock.call_count, 2)
         self.assertEqual(response.headers["Cache-Control"], f"public, max-age={FRAMES_CACHE_TTL_SECONDS}")
 
     def test_frames_endpoint_supports_west_satellite(self) -> None:
         response = Response()
+        coordinates = [[-170.0, 60.0], [-90.0, 60.0], [-90.0, -20.0], [-170.0, -20.0]]
         with patch.object(
             main,
             "get_recent_frames",
@@ -128,7 +149,7 @@ class MainCMIEndpointTests(unittest.TestCase):
                     file_ref="s3://noaa-goes18/path/west-frame.nc",
                 )
             ],
-        ):
+        ), patch.object(main, "get_image_artifacts", return_value=(Path("/tmp/west-frame.png"), coordinates)):
             payload = main.cmi_ch13_frames(
                 request=_request(),
                 response=response,
@@ -139,6 +160,7 @@ class MainCMIEndpointTests(unittest.TestCase):
 
         self.assertEqual(payload.satellite, "goes-west")
         self.assertEqual(payload.count, 1)
+        self.assertEqual(payload.frames[0].coordinates, [tuple(point) for point in coordinates])
 
     def test_frames_endpoint_returns_503_without_cache(self) -> None:
         response = Response()
@@ -155,32 +177,35 @@ class MainCMIEndpointTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 502)
 
-    def test_tile_endpoint_rejects_zoom_above_max(self) -> None:
-        with self.assertRaises(HTTPException) as ctx:
-            main.cmi_ch13_tile(satellite="goes-east", frame_id="abc", z=NATIVE_ZOOM + 1, x=0, y=0)
-        self.assertEqual(ctx.exception.status_code, 422)
-
-    def test_tile_endpoint_serves_png_and_long_cache(self) -> None:
+    def test_image_endpoint_serves_png_and_long_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            png_path = Path(tmp_dir) / "tile.png"
+            png_path = Path(tmp_dir) / "frame.png"
             png_path.write_bytes(
                 b"\x89PNG\r\n\x1a\n"
                 b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
                 b"\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01\xf6\x178U"
                 b"\x00\x00\x00\x00IEND\xaeB`\x82"
             )
-            with patch.object(main, "get_tile_path", return_value=png_path):
-                response = main.cmi_ch13_tile(
+            with patch.object(
+                main,
+                "get_image_artifacts",
+                return_value=(png_path, [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]]),
+            ):
+                response = main.cmi_ch13_image(
                     satellite="goes-east",
                     frame_id="frame-id",
-                    z=NATIVE_ZOOM,
-                    x=1,
-                    y=1,
                 )
 
         self.assertIsInstance(response, FileResponse)
         self.assertEqual(response.media_type, "image/png")
         self.assertEqual(response.headers["Cache-Control"], "public, max-age=31536000, immutable")
+
+    def test_image_endpoint_returns_404_for_unknown_frame(self) -> None:
+        with patch.object(main, "get_image_artifacts", side_effect=main.CMIFrameNotFoundError("missing")):
+            with self.assertRaises(HTTPException) as ctx:
+                main.cmi_ch13_image(satellite="goes-east", frame_id="missing")
+
+        self.assertEqual(ctx.exception.status_code, 404)
 
     def test_startup_and_shutdown_wire_both_services(self) -> None:
         with patch.object(main, "start_glm_background_refresh") as start_glm, patch.object(

@@ -19,10 +19,6 @@ class CMIFrameNotFoundError(CMIFetchError):
     """Raised when a requested frame id cannot be resolved."""
 
 
-class CMIInvalidTileError(CMIFetchError):
-    """Raised when tile coordinates are invalid."""
-
-
 @dataclass(frozen=True)
 class CMIFrame:
     frame_id: str
