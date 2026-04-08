@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -20,7 +21,6 @@ from cmi.store import (
     CMIFrame,
     CMIFetchError,
     CMIFrameNotFoundError,
-    CMIInvalidTileError,
     FRAME_RETENTION_COUNT,
     get_frame,
     has_frame,
@@ -34,10 +34,7 @@ SATELLITE_TO_ID = {
     "goes-west": 18,
 }
 POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "30"))
-NATIVE_ZOOM = int(os.getenv("CMI_NATIVE_ZOOM", "2"))
-MAX_ZOOM = NATIVE_ZOOM
 FRAME_LOOKBACK = "4h"
-TILE_SIZE = 256
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
 TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
@@ -47,7 +44,8 @@ FRAME_RETENTION_SECONDS = 2 * 60 * 60
 CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
 SOURCE_DIR = CMI_CACHE_DIR / "source"
 RASTER_DIR = CMI_CACHE_DIR / "rasters"
-TILE_DIR = CMI_CACHE_DIR / "tiles"
+IMAGE_DIR = CMI_CACHE_DIR / "images"
+METADATA_DIR = CMI_CACHE_DIR / "metadata"
 
 FRAME_TOKEN_PATTERN = re.compile(r"_(s\d{13,19})_(e\d{13,19})_")
 
@@ -57,8 +55,8 @@ _poller_stop_event = Event()
 _poller_lock = Lock()
 _frame_locks: dict[tuple[str, str], Lock] = {}
 _frame_locks_guard = Lock()
-_tile_locks: dict[tuple[str, str, int, int, int], Lock] = {}
-_tile_locks_guard = Lock()
+_image_locks: dict[tuple[str, str], Lock] = {}
+_image_locks_guard = Lock()
 _frame_warmups: dict[tuple[str, str], "_FrameWarmupEntry"] = {}
 _frame_warmups_guard = Lock()
 
@@ -71,7 +69,7 @@ class _FrameWarmupEntry:
 
 
 def _ensure_cache_dirs() -> None:
-    for directory in (SOURCE_DIR, RASTER_DIR, TILE_DIR):
+    for directory in (SOURCE_DIR, RASTER_DIR, IMAGE_DIR, METADATA_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -81,18 +79,13 @@ def _load_goes_timerange():
     return _goes_timerange
 
 
-def _require_tile_dependencies() -> tuple[object, object]:
-    try:
-        import mercantile
-    except Exception as exc:
-        raise CMIFetchError("Missing dependency 'mercantile'. Install requirements.txt.") from exc
-
+def _require_rasterio():
     try:
         import rasterio
     except Exception as exc:
         raise CMIFetchError("Missing dependency 'rasterio'. Install requirements.txt.") from exc
 
-    return mercantile, rasterio
+    return rasterio
 
 
 def _flatten_paths(values: list[object]) -> list[str]:
@@ -172,13 +165,13 @@ def _frame_lock_for(satellite: str, frame_id: str) -> Lock:
         return lock
 
 
-def _tile_lock_for(satellite: str, frame_id: str, z: int, x: int, y: int) -> Lock:
-    key = (satellite, frame_id, z, x, y)
-    with _tile_locks_guard:
-        lock = _tile_locks.get(key)
+def _image_lock_for(satellite: str, frame_id: str) -> Lock:
+    key = (satellite, frame_id)
+    with _image_locks_guard:
+        lock = _image_locks.get(key)
         if lock is None:
             lock = Lock()
-            _tile_locks[key] = lock
+            _image_locks[key] = lock
         return lock
 
 
@@ -336,7 +329,7 @@ def materialize_file(file_ref: str) -> Path:
 
 
 def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[object, object]:
-    _, rasterio = _require_tile_dependencies()
+    rasterio = _require_rasterio()
     from rasterio.crs import CRS
     from rasterio.transform import from_bounds
 
@@ -370,16 +363,18 @@ def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[o
         ds.close()
 
 
+def _valid_cmi_mask(cmi_values: np.ndarray, fill_value: float | None) -> np.ndarray:
+    valid_mask = np.isfinite(cmi_values)
+    if fill_value is not None:
+        valid_mask &= cmi_values != float(fill_value)
+    return valid_mask
+
+
 def _cmi_to_grayscale(cmi_values: np.ndarray, fill_value: float | None) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(cmi_values, dtype=np.float32)
-    valid_mask = np.isfinite(values)
-    if fill_value is not None:
-        valid_mask &= values != float(fill_value)
-
+    valid_mask = _valid_cmi_mask(values, fill_value=fill_value)
     clipped = np.clip(values, TEMP_COLD_K, TEMP_WARM_K)
 
-    # Focus the overlay on colder, denser cloud tops instead of rendering the full
-    # brightness-temperature field as an opaque gray veil.
     visible_range = max(TEMP_VISIBLE_CLOUD_K - TEMP_DENSE_CLOUD_K, 1.0)
     cloud_focus = np.clip((TEMP_VISIBLE_CLOUD_K - clipped) / visible_range, 0.0, 1.0)
     brightness = np.power(cloud_focus, 0.85)
@@ -393,16 +388,12 @@ def frame_raster_path(satellite: str, frame_id: str) -> Path:
     return RASTER_DIR / satellite / f"{frame_id}.tif"
 
 
-def tile_png_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path:
-    return TILE_DIR / satellite / frame_id / str(z) / str(x) / f"{y}.png"
+def frame_image_path(satellite: str, frame_id: str) -> Path:
+    return IMAGE_DIR / satellite / f"{frame_id}.png"
 
 
-def _validate_tile_xyz(z: int, x: int, y: int) -> None:
-    if z != NATIVE_ZOOM:
-        raise CMIInvalidTileError(f"Unsupported zoom level {z}. Only zoom {NATIVE_ZOOM} is available.")
-    limit = 1 << z
-    if not (0 <= x < limit and 0 <= y < limit):
-        raise CMIInvalidTileError(f"Tile coordinates out of range for zoom {z}: x={x}, y={y}")
+def frame_metadata_path(satellite: str, frame_id: str) -> Path:
+    return METADATA_DIR / satellite / f"{frame_id}.json"
 
 
 def build_frame_raster(frame: CMIFrame) -> Path:
@@ -432,6 +423,7 @@ def build_frame_raster(frame: CMIFrame) -> Path:
             ds.close()
 
         gray, alpha = _cmi_to_grayscale(values, fill_value=fill_value)
+        coverage = np.where(_valid_cmi_mask(values, fill_value=fill_value), 255, 0).astype(np.uint8)
         height, width = gray.shape
         crs, transform = _projection_and_transform(source_path, width=width, height=height)
 
@@ -440,7 +432,7 @@ def build_frame_raster(frame: CMIFrame) -> Path:
             "driver": "GTiff",
             "width": width,
             "height": height,
-            "count": 2,
+            "count": 3,
             "dtype": "uint8",
             "crs": crs,
             "transform": transform,
@@ -450,53 +442,100 @@ def build_frame_raster(frame: CMIFrame) -> Path:
             "blockxsize": 512,
             "blockysize": 512,
         }
-        _, rasterio = _require_tile_dependencies()
+        rasterio = _require_rasterio()
         with rasterio.open(raster_path, "w", **profile) as dst:
             dst.write(gray, 1)
             dst.write(alpha, 2)
+            dst.write(coverage, 3)
         return raster_path
 
 
-def render_tile(frame: CMIFrame, z: int, x: int, y: int) -> Path:
-    _validate_tile_xyz(z=z, x=x, y=y)
-    _ensure_cache_dirs()
-    tile_path = tile_png_path(frame.satellite, frame.frame_id, z, x, y)
-    if tile_path.exists():
-        return tile_path
+def _frame_coordinates_from_source(src, coverage: np.ndarray) -> list[list[float]]:
+    rasterio = _require_rasterio()
+    from rasterio.transform import xy
+    from rasterio.warp import transform_bounds
 
-    tile_lock = _tile_lock_for(frame.satellite, frame.frame_id, z, x, y)
-    with tile_lock:
-        if tile_path.exists():
-            return tile_path
+    rows, cols = np.nonzero(coverage > 0)
+    if rows.size == 0 or cols.size == 0:
+        raise CMIFetchError("CMI frame has no valid coverage.")
+
+    min_row = int(rows.min())
+    max_row = int(rows.max())
+    min_col = int(cols.min())
+    max_col = int(cols.max())
+
+    west_x, north_y = xy(src.transform, min_row, min_col, offset="ul")
+    east_x, south_y = xy(src.transform, max_row, max_col, offset="lr")
+    west, south, east, north = transform_bounds(
+        src.crs,
+        "EPSG:4326",
+        west_x,
+        south_y,
+        east_x,
+        north_y,
+        densify_pts=21,
+    )
+    return [
+        [float(west), float(north)],
+        [float(east), float(north)],
+        [float(east), float(south)],
+        [float(west), float(south)],
+    ]
+
+
+def _write_frame_metadata(metadata_path: Path, coordinates: list[list[float]]) -> None:
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps({"coordinates": coordinates}), encoding="utf-8")
+
+
+def _read_frame_metadata(metadata_path: Path) -> list[list[float]]:
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    coordinates = payload["coordinates"]
+    if not isinstance(coordinates, list) or len(coordinates) != 4:
+        raise CMIFetchError(f"Invalid image metadata in {metadata_path}")
+    return coordinates
+
+
+def render_frame_image(frame: CMIFrame) -> tuple[Path, list[list[float]]]:
+    _ensure_cache_dirs()
+    image_path = frame_image_path(frame.satellite, frame.frame_id)
+    metadata_path = frame_metadata_path(frame.satellite, frame.frame_id)
+    if image_path.exists() and metadata_path.exists():
+        return image_path, _read_frame_metadata(metadata_path)
+
+    image_lock = _image_lock_for(frame.satellite, frame.frame_id)
+    with image_lock:
+        if image_path.exists() and metadata_path.exists():
+            return image_path, _read_frame_metadata(metadata_path)
 
         raster_path = build_frame_raster(frame)
-        tile_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mercantile, rasterio = _require_tile_dependencies()
+        rasterio = _require_rasterio()
         from rasterio.enums import Resampling
         from rasterio.transform import from_bounds as transform_from_bounds
         from rasterio.warp import reproject
 
-        bounds = mercantile.xy_bounds(mercantile.Tile(x=x, y=y, z=z))
-        tile_transform = transform_from_bounds(
-            bounds.left,
-            bounds.bottom,
-            bounds.right,
-            bounds.top,
-            TILE_SIZE,
-            TILE_SIZE,
-        )
-        gray = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-        alpha = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-
         with rasterio.open(raster_path) as src:
+            source_coverage = src.read(3)
+            coordinates = _frame_coordinates_from_source(src, source_coverage)
+            west, north = coordinates[0]
+            east, south = coordinates[2]
+
+            width = src.width
+            height = src.height
+            image_transform = transform_from_bounds(west, south, east, north, width, height)
+            gray = np.zeros((height, width), dtype=np.uint8)
+            alpha = np.zeros((height, width), dtype=np.uint8)
+            coverage = np.zeros((height, width), dtype=np.uint8)
+
             reproject(
                 source=rasterio.band(src, 1),
                 destination=gray,
                 src_transform=src.transform,
                 src_crs=src.crs,
-                dst_transform=tile_transform,
-                dst_crs="EPSG:3857",
+                dst_transform=image_transform,
+                dst_crs="EPSG:4326",
                 dst_nodata=0,
                 resampling=Resampling.bilinear,
             )
@@ -505,28 +544,43 @@ def render_tile(frame: CMIFrame, z: int, x: int, y: int) -> Path:
                 destination=alpha,
                 src_transform=src.transform,
                 src_crs=src.crs,
-                dst_transform=tile_transform,
-                dst_crs="EPSG:3857",
+                dst_transform=image_transform,
+                dst_crs="EPSG:4326",
+                dst_nodata=0,
+                resampling=Resampling.bilinear,
+            )
+            reproject(
+                source=rasterio.band(src, 3),
+                destination=coverage,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=image_transform,
+                dst_crs="EPSG:4326",
                 dst_nodata=0,
                 resampling=Resampling.bilinear,
             )
 
-        alpha[alpha < 8] = 0
-        rgba = np.stack((gray, gray, gray, gray), axis=0).astype(np.uint8)
-        rgba[3] = alpha
+        coverage = np.clip(coverage, 0, 255).astype(np.uint8)
+        alpha = ((alpha.astype(np.uint16) * coverage.astype(np.uint16)) // 255).astype(np.uint8)
+        alpha[coverage < 6] = 0
+        gray[alpha == 0] = 0
+
+        rgba = np.stack((gray, gray, gray, alpha), axis=0).astype(np.uint8)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
             with rasterio.open(
-                tile_path,
+                image_path,
                 "w",
                 driver="PNG",
-                width=TILE_SIZE,
-                height=TILE_SIZE,
+                width=width,
+                height=height,
                 count=4,
                 dtype="uint8",
             ) as dst:
                 dst.write(rgba)
-        return tile_path
+
+        _write_frame_metadata(metadata_path, coordinates)
+        return image_path, coordinates
 
 
 def prepare_frame(frame: CMIFrame) -> CMIFrame:
@@ -534,6 +588,7 @@ def prepare_frame(frame: CMIFrame) -> CMIFrame:
         return frame
 
     build_frame_raster(frame)
+    render_frame_image(frame)
     return store_prepared_frame(frame)
 
 
@@ -552,19 +607,19 @@ def prepare_frame_with_tracking(frame: CMIFrame) -> CMIFrame:
     return prepared
 
 
-def get_prepared_tile_path(satellite: str, frame_id: str, z: int, x: int, y: int) -> Path:
-    _validate_tile_xyz(z=z, x=x, y=y)
-    tile_path = tile_png_path(satellite, frame_id, z, x, y)
-    if tile_path.exists():
-        return tile_path
+def get_prepared_image_artifacts(satellite: str, frame_id: str) -> tuple[Path, list[list[float]]]:
+    image_path = frame_image_path(satellite, frame_id)
+    metadata_path = frame_metadata_path(satellite, frame_id)
+    if image_path.exists() and metadata_path.exists():
+        return image_path, _read_frame_metadata(metadata_path)
 
     frame = get_frame(satellite=satellite, frame_id=frame_id)
-    return render_tile(frame=frame, z=z, x=x, y=y)
+    return render_frame_image(frame=frame)
 
 
 def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> None:
     cutoff_epoch = time() - retention_seconds
-    for root in (SOURCE_DIR, RASTER_DIR, TILE_DIR):
+    for root in (SOURCE_DIR, RASTER_DIR, IMAGE_DIR, METADATA_DIR):
         if not root.exists():
             continue
         for path in root.rglob("*"):
