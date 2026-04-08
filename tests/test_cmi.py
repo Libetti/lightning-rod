@@ -138,6 +138,16 @@ class CMIUnitTests(unittest.TestCase):
         self.assertGreater(int(alpha[0, 2]), int(alpha[0, 1]))
         self.assertGreater(int(gray[0, 2]), int(gray[0, 1]))
 
+    def test_smooth_coverage_mask_softens_spikes(self) -> None:
+        coverage = np.zeros((7, 7), dtype=np.uint8)
+        coverage[:, 3] = 255
+
+        smoothed = cmi._smooth_coverage_mask(coverage, radius=1, passes=2)
+
+        self.assertLess(int(smoothed[3, 3]), 255)
+        self.assertGreater(int(smoothed[3, 2]), 0)
+        self.assertGreater(int(smoothed[3, 4]), 0)
+
     def test_prepare_frame_publishes_after_image_build(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",

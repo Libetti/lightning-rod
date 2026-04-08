@@ -40,6 +40,8 @@ TEMP_WARM_K = 320.0
 TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
 TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
 FRAME_RETENTION_SECONDS = 2 * 60 * 60
+EDGE_SMOOTH_RADIUS = int(os.getenv("CMI_EDGE_SMOOTH_RADIUS", "2"))
+EDGE_SMOOTH_PASSES = int(os.getenv("CMI_EDGE_SMOOTH_PASSES", "2"))
 
 CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
 SOURCE_DIR = CMI_CACHE_DIR / "source"
@@ -384,6 +386,30 @@ def _cmi_to_grayscale(cmi_values: np.ndarray, fill_value: float | None) -> tuple
     return gray, alpha
 
 
+def _box_blur(values: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return values.astype(np.float32, copy=True)
+
+    working = np.asarray(values, dtype=np.float32)
+    padded = np.pad(working, ((radius, radius), (radius, radius)), mode="edge")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    kernel = radius * 2 + 1
+    total = (
+        integral[kernel:, kernel:]
+        - integral[:-kernel, kernel:]
+        - integral[kernel:, :-kernel]
+        + integral[:-kernel, :-kernel]
+    )
+    return total / float(kernel * kernel)
+
+
+def _smooth_coverage_mask(values: np.ndarray, radius: int = EDGE_SMOOTH_RADIUS, passes: int = EDGE_SMOOTH_PASSES) -> np.ndarray:
+    smoothed = np.asarray(values, dtype=np.float32)
+    for _ in range(max(passes, 0)):
+        smoothed = _box_blur(smoothed, radius=radius)
+    return np.clip(smoothed, 0, 255).astype(np.uint8)
+
+
 def frame_raster_path(satellite: str, frame_id: str) -> Path:
     return RASTER_DIR / satellite / f"{frame_id}.tif"
 
@@ -560,7 +586,7 @@ def render_frame_image(frame: CMIFrame) -> tuple[Path, list[list[float]]]:
                 resampling=Resampling.bilinear,
             )
 
-        coverage = np.clip(coverage, 0, 255).astype(np.uint8)
+        coverage = _smooth_coverage_mask(np.clip(coverage, 0, 255).astype(np.uint8))
         alpha = ((alpha.astype(np.uint16) * coverage.astype(np.uint16)) // 255).astype(np.uint8)
         alpha[coverage < 6] = 0
         gray[alpha == 0] = 0
