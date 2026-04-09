@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,13 +112,15 @@ class MainCMIEndpointTests(unittest.TestCase):
         coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
 
         response = Response()
-        with patch.object(main, "get_recent_frames", return_value=mock_frames), patch.object(
+        with patch.object(main, "get_frames_in_range", return_value=mock_frames), patch.object(
             main, "get_image_artifacts", return_value=(Path("/tmp/frame.png"), coordinates)
         ) as image_mock:
             payload = main.cmi_ch13_frames(
                 request=_request(),
                 response=response,
                 satellite="goes-east",
+                start=datetime(2026, 3, 16, 9, 0, tzinfo=timezone.utc),
+                end=datetime(2026, 3, 16, 11, 0, tzinfo=timezone.utc),
                 limit=2,
                 poll_hint=10,
             )
@@ -139,7 +142,7 @@ class MainCMIEndpointTests(unittest.TestCase):
         coordinates = [[-170.0, 60.0], [-90.0, 60.0], [-90.0, -20.0], [-170.0, -20.0]]
         with patch.object(
             main,
-            "get_recent_frames",
+            "get_frames_in_range",
             return_value=[
                 CMIFrame(
                     frame_id="west-frame",
@@ -154,6 +157,8 @@ class MainCMIEndpointTests(unittest.TestCase):
                 request=_request(),
                 response=response,
                 satellite="goes-west",
+                start=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                end=datetime(2026, 3, 16, 11, 0, tzinfo=timezone.utc),
                 limit=1,
                 poll_hint=10,
             )
@@ -162,15 +167,57 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertEqual(payload.count, 1)
         self.assertEqual(payload.frames[0].coordinates, [tuple(point) for point in coordinates])
 
+    def test_frames_endpoint_supports_time_window_queries(self) -> None:
+        frames = [
+            CMIFrame(
+                frame_id="frame-b",
+                satellite="goes-east",
+                start_time="2026-03-16T10:10:00Z",
+                end_time="2026-03-16T10:19:59Z",
+                file_ref="s3://noaa-goes19/path/frame-b.nc",
+            ),
+            CMIFrame(
+                frame_id="frame-a",
+                satellite="goes-east",
+                start_time="2026-03-16T10:00:00Z",
+                end_time="2026-03-16T10:09:59Z",
+                file_ref="s3://noaa-goes19/path/frame-a.nc",
+            ),
+        ]
+        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
+        response = Response()
+        with patch.object(main, "get_frames_in_range", return_value=frames) as range_mock, patch.object(
+            main, "get_image_artifacts", return_value=(Path("/tmp/frame.png"), coordinates)
+        ):
+            payload = main.cmi_ch13_frames(
+                request=_request(),
+                response=response,
+                satellite="goes-east",
+                limit=500,
+                start=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                end=datetime(2026, 3, 16, 11, 0, tzinfo=timezone.utc),
+                poll_hint=3600,
+            )
+
+        self.assertEqual([frame.frame_id for frame in payload.frames], ["frame-a", "frame-b"])
+        range_mock.assert_called_once_with(
+            satellite="goes-east",
+            start="2026-03-16T10:00:00Z",
+            end="2026-03-16T11:00:00Z",
+            limit=500,
+        )
+
     def test_frames_endpoint_returns_503_without_cache(self) -> None:
         response = Response()
 
-        with patch.object(main, "get_recent_frames", side_effect=main.CMIFetchError("No cached CMI frame available yet.")):
+        with patch.object(main, "get_frames_in_range", side_effect=main.CMIFetchError("No cached CMI frame available yet.")):
             with self.assertRaises(HTTPException) as ctx:
                 main.cmi_ch13_frames(
                     request=_request(),
                     response=response,
                     satellite="goes-east",
+                    start=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                    end=datetime(2026, 3, 16, 11, 0, tzinfo=timezone.utc),
                     limit=2,
                     poll_hint=10,
                 )

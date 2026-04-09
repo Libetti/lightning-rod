@@ -41,7 +41,7 @@ Tiny FastAPI server for exposing NOAA GOES data for:
    - Health: `http://127.0.0.1:8000/health`
    - Latest lightning frame: `http://127.0.0.1:8000/lightning/latest-frame`
    - Latest lightning points: `http://127.0.0.1:8000/lightning/latest-points?satellite=goes-west&limit=1000`
-   - CMI Ch13 frame list: `http://127.0.0.1:8000/imagery/cmi/ch13/frames?satellite=goes-east&limit=12`
+   - CMI Ch13 frame list: `http://127.0.0.1:8000/imagery/cmi/ch13/frames?satellite=goes-east&start=2026-04-08T00:00:00Z&end=2026-04-08T01:00:00Z`
    - CMI Ch13 frame image: `http://127.0.0.1:8000/imagery/cmi/ch13/images/{satellite}/{frame_id}.png`
 
 ## Lightning Notes

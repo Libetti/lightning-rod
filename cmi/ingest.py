@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Event, Lock, Thread
-from time import time
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
@@ -21,9 +20,10 @@ from cmi.store import (
     CMIFrame,
     CMIFetchError,
     CMIFrameNotFoundError,
-    FRAME_RETENTION_COUNT,
+    FRAME_RETENTION_HOURS,
     get_frame,
     has_frame,
+    prune_expired_frames,
     store_prepared_frame,
 )
 
@@ -33,13 +33,13 @@ SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "30"))
-FRAME_LOOKBACK = "4h"
+POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "3600"))
+LOOKBACK_HOURS = int(os.getenv("CMI_LOOKBACK_HOURS", "48"))
+INCREMENTAL_LOOKBACK_HOURS = int(os.getenv("CMI_INCREMENTAL_LOOKBACK_HOURS", "3"))
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
 TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
 TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
-FRAME_RETENTION_SECONDS = 2 * 60 * 60
 EDGE_SMOOTH_RADIUS = int(os.getenv("CMI_EDGE_SMOOTH_RADIUS", "2"))
 EDGE_SMOOTH_PASSES = int(os.getenv("CMI_EDGE_SMOOTH_PASSES", "2"))
 
@@ -209,7 +209,24 @@ def wait_for_frame_warmup(satellite: str, frame_id: str) -> CMIFrame:
     return entry.frame
 
 
-def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
+def _iso_to_utc_datetime(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _retention_cutoff(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    return current - timedelta(hours=FRAME_RETENTION_HOURS)
+
+
+def _frame_is_within_retention(frame: CMIFrame, now: datetime | None = None) -> bool:
+    return _iso_to_utc_datetime(frame.start_time) >= _retention_cutoff(now=now)
+
+
+def _lookback_window(hours: int) -> str:
+    return f"{max(int(hours), 1)}h"
+
+
+def _list_recent_cmi_file_refs(satellite_id: int, recent_window: str) -> list[str]:
     local_refs = _local_cmi_file_refs(satellite_id=satellite_id)
     try:
         goes_timerange = _load_goes_timerange()
@@ -218,7 +235,7 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
             product="ABI-L2-CMIP",
             domain="F",
             bands=13,
-            recent=FRAME_LOOKBACK,
+            recent=recent_window,
             return_as="filelist",
             download=False,
             save_dir=gettempdir(),
@@ -286,14 +303,19 @@ def _frames_from_file_refs(satellite: str, file_refs: list[str]) -> list[CMIFram
     return [frame for _, frame in ordered]
 
 
-def discover_recent_frames(satellite: str) -> list[CMIFrame]:
+def discover_recent_frames(satellite: str, lookback_hours: int = LOOKBACK_HOURS) -> list[CMIFrame]:
     satellite_id = SATELLITE_TO_ID.get(satellite)
     if not satellite_id:
         raise CMIFetchError("Unsupported satellite. Use goes-east or goes-west.")
 
     with _upstream_io_lock:
-        file_refs = _list_recent_cmi_file_refs(satellite_id=satellite_id)
+        file_refs = _list_recent_cmi_file_refs(
+            satellite_id=satellite_id,
+            recent_window=_lookback_window(lookback_hours),
+        )
     frames = _frames_from_file_refs(satellite=satellite, file_refs=file_refs)
+    cutoff = _retention_cutoff()
+    frames = [frame for frame in frames if _iso_to_utc_datetime(frame.start_time) >= cutoff]
     if not frames:
         raise CMIFetchError("No recent CMI frames were found.")
     return frames
@@ -643,8 +665,17 @@ def get_prepared_image_artifacts(satellite: str, frame_id: str) -> tuple[Path, l
     return render_frame_image(frame=frame)
 
 
-def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> None:
-    cutoff_epoch = time() - retention_seconds
+def _path_frame_timestamp(path: Path) -> datetime | None:
+    try:
+        stem = path.stem if path.suffix else path.name
+        start_token, _ = _extract_tokens(stem)
+    except CMIFetchError:
+        return None
+    return _iso_to_utc_datetime(_goes_token_to_iso(start_token))
+
+
+def cleanup_stale_cache(now: datetime | None = None) -> None:
+    cutoff = _retention_cutoff(now=now)
     for root in (SOURCE_DIR, RASTER_DIR, IMAGE_DIR, METADATA_DIR):
         if not root.exists():
             continue
@@ -652,7 +683,10 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
             if not path.is_file():
                 continue
             try:
-                if path.stat().st_mtime < cutoff_epoch:
+                frame_timestamp = _path_frame_timestamp(path)
+                if frame_timestamp is None:
+                    continue
+                if frame_timestamp < cutoff:
                     path.unlink(missing_ok=True)
             except OSError:
                 logger.exception("Failed to remove stale CMI cache file: %s", path)
@@ -665,7 +699,7 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
 
 
 def _prepare_latest_frame(satellite: str) -> None:
-    frames = discover_recent_frames(satellite)
+    frames = discover_recent_frames(satellite, lookback_hours=INCREMENTAL_LOOKBACK_HOURS)
     if frames:
         prepare_frame_with_tracking(frames[0])
 
@@ -673,8 +707,10 @@ def _prepare_latest_frame(satellite: str) -> None:
 def _poll_once() -> None:
     for satellite in SATELLITE_TO_ID:
         try:
-            frames = discover_recent_frames(satellite)
-            for frame in reversed(frames[:FRAME_RETENTION_COUNT]):
+            frames = discover_recent_frames(satellite, lookback_hours=INCREMENTAL_LOOKBACK_HOURS)
+            for frame in reversed(frames):
+                if not _frame_is_within_retention(frame):
+                    continue
                 if has_frame(frame.satellite, frame.frame_id):
                     continue
                 prepare_frame_with_tracking(frame)
@@ -682,6 +718,7 @@ def _poll_once() -> None:
             logger.exception("Failed to refresh latest CMI frames for %s", satellite)
         except Exception:
             logger.exception("Unexpected error refreshing CMI frames for %s", satellite)
+    prune_expired_frames()
     cleanup_stale_cache()
 
 
@@ -702,6 +739,22 @@ def _warm_latest_then_poll_loop() -> None:
         except Exception:
             logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
 
+    for satellite in SATELLITE_TO_ID:
+        if _poller_stop_event.is_set():
+            return
+        try:
+            frames = discover_recent_frames(satellite, lookback_hours=LOOKBACK_HOURS)
+            for frame in reversed(frames):
+                if has_frame(frame.satellite, frame.frame_id):
+                    continue
+                prepare_frame_with_tracking(frame)
+        except CMIFetchError:
+            logger.exception("Failed to backfill CMI history for %s", satellite)
+        except Exception:
+            logger.exception("Unexpected error backfilling CMI history for %s", satellite)
+
+    prune_expired_frames()
+    cleanup_stale_cache()
     _poll_loop()
 
 

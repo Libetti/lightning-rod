@@ -3,12 +3,12 @@ from __future__ import annotations
 import os
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 FRAMES_CACHE_TTL_SECONDS = 30
-POLL_INTERVAL_HINT_SECONDS = 30
-FRAME_RETENTION_COUNT = int(os.getenv("CMI_FRAME_RETENTION_COUNT", "12"))
+POLL_INTERVAL_HINT_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "3600"))
+FRAME_RETENTION_HOURS = int(os.getenv("CMI_RETENTION_HOURS", "48"))
 
 
 class CMIFetchError(Exception):
@@ -40,6 +40,37 @@ _frame_index: dict[tuple[str, str], _FrameStoreEntry] = {}
 _store_lock = Lock()
 
 
+def _parse_iso8601(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def _retention_cutoff(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    return current - timedelta(hours=FRAME_RETENTION_HOURS)
+
+
+def _prune_satellite_locked(satellite: str, now: datetime | None = None) -> None:
+    frames = list(_frames_by_satellite.get(satellite, ()))
+    if not frames:
+        _latest_by_satellite.pop(satellite, None)
+        return
+
+    cutoff = _retention_cutoff(now=now)
+    retained = [item for item in frames if _parse_iso8601(item.frame.start_time) >= cutoff]
+    _frames_by_satellite[satellite] = deque(retained)
+
+    if retained:
+        _latest_by_satellite[satellite] = retained[0]
+    else:
+        _latest_by_satellite.pop(satellite, None)
+
+    stale_keys = [key for key in _frame_index if key[0] == satellite]
+    for key in stale_keys:
+        _frame_index.pop(key, None)
+    for item in retained:
+        _frame_index[(satellite, item.frame.frame_id)] = item
+
+
 def store_prepared_frame(frame: CMIFrame) -> CMIFrame:
     entry = _FrameStoreEntry(
         frame=replace(frame),
@@ -62,48 +93,65 @@ def store_prepared_frame(frame: CMIFrame) -> CMIFrame:
             key=lambda item: (item.frame.start_time, item.frame.end_time, item.frame.frame_id),
             reverse=True,
         )
-        retained = deduped_entries[:FRAME_RETENTION_COUNT]
-        deduped = deque(retained, maxlen=FRAME_RETENTION_COUNT)
-
-        _frames_by_satellite[frame.satellite] = deduped
-        _latest_by_satellite[frame.satellite] = deduped[0]
-        _frame_index[(frame.satellite, frame.frame_id)] = entry
-
-        retained_ids = {item.frame.frame_id for item in retained}
-        stale_keys = [
-            key for key in _frame_index
-            if key[0] == frame.satellite and key[1] not in retained_ids
-        ]
-        for key in stale_keys:
-            _frame_index.pop(key, None)
+        _frames_by_satellite[frame.satellite] = deque(deduped_entries)
+        _prune_satellite_locked(frame.satellite)
 
     return replace(frame)
 
 
 def has_frame(satellite: str, frame_id: str) -> bool:
     with _store_lock:
+        _prune_satellite_locked(satellite)
         return (satellite, frame_id) in _frame_index
 
 
 def get_latest_frame(satellite: str) -> tuple[CMIFrame, str]:
     with _store_lock:
+        _prune_satellite_locked(satellite)
         entry = _latest_by_satellite.get(satellite)
         if entry is None:
             raise CMIFetchError(f"No cached CMI frame available yet for {satellite}.")
         return replace(entry.frame), entry.updated_at
 
 
-def get_recent_frames(satellite: str, limit: int) -> list[CMIFrame]:
+def get_frames_in_range(
+    satellite: str,
+    start: str,
+    end: str,
+    limit: int = 1000,
+) -> list[CMIFrame]:
     with _store_lock:
+        _prune_satellite_locked(satellite)
         entries = list(_frames_by_satellite.get(satellite, ()))
         if not entries:
             raise CMIFetchError(f"No cached CMI frame available yet for {satellite}.")
-        return [replace(entry.frame) for entry in entries[:limit]]
+
+        start_dt = _parse_iso8601(start)
+        end_dt = _parse_iso8601(end)
+
+        filtered: list[CMIFrame] = []
+        for entry in entries:
+            frame_start = _parse_iso8601(entry.frame.start_time)
+            if frame_start < start_dt:
+                continue
+            if frame_start >= end_dt:
+                continue
+            filtered.append(replace(entry.frame))
+            if len(filtered) >= limit:
+                break
+        return filtered
 
 
 def get_frame(satellite: str, frame_id: str) -> CMIFrame:
     with _store_lock:
+        _prune_satellite_locked(satellite)
         entry = _frame_index.get((satellite, frame_id))
         if entry is None:
             raise CMIFrameNotFoundError(f"Frame not found for {satellite}: {frame_id}")
         return replace(entry.frame)
+
+
+def prune_expired_frames(now: datetime | None = None) -> None:
+    with _store_lock:
+        for satellite in list(_frames_by_satellite):
+            _prune_satellite_locked(satellite, now=now)

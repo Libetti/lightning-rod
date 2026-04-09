@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -12,8 +13,8 @@ from cmi.service import (
     POLL_INTERVAL_HINT_SECONDS,
     CMIFetchError,
     CMIFrameNotFoundError,
+    get_frames_in_range,
     get_image_artifacts,
-    get_recent_frames,
     start_background_refresh as start_cmi_background_refresh,
     stop_background_refresh as stop_cmi_background_refresh,
 )
@@ -154,19 +155,35 @@ def cmi_ch13_frames(
     request: Request,
     response: Response,
     satellite: Literal["goes-east", "goes-west"] = Query(default="goes-east"),
-    limit: int = Query(default=12, ge=1, le=120),
-    poll_hint: int = Query(default=POLL_INTERVAL_HINT_SECONDS, ge=1, le=60),
+    start: datetime = Query(),
+    end: datetime = Query(),
+    limit: int = Query(default=1000, ge=1, le=1000),
+    poll_hint: int = Query(default=POLL_INTERVAL_HINT_SECONDS, ge=1, le=7200),
 ) -> CMIFramesResponse:
+    if start >= end:
+        raise HTTPException(status_code=422, detail="start must be before end")
+
+    start_iso = start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_iso = end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     try:
-        frames = get_recent_frames(satellite=satellite, limit=limit)
+        frames = get_frames_in_range(
+            satellite=satellite,
+            start=start_iso,
+            end=end_iso,
+            limit=limit,
+        )
     except CMIFetchError as exc:
         logger.exception(
-            "CMI frames request failed: satellite=%s limit=%s poll_hint=%s",
+            "CMI frames request failed: satellite=%s limit=%s start=%s end=%s poll_hint=%s",
             satellite,
             limit,
+            start_iso,
+            end_iso,
             poll_hint,
         )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    frames = sorted(frames, key=lambda frame: (frame.start_time, frame.end_time, frame.frame_id))
 
     base_url = str(request.base_url).rstrip("/")
     frame_models = [
