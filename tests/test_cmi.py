@@ -373,12 +373,15 @@ class CMIUnitTests(unittest.TestCase):
             "prepare_frame_with_tracking",
             side_effect=[cmi.CMIFetchError("reset by peer"), next_frame],
         ) as prepare_mock:
-            cmi._prepare_missing_frames([next_frame, failed])
+            result = cmi._prepare_missing_frames([next_frame, failed])
 
         self.assertEqual(
             [call.args[0].frame_id for call in prepare_mock.call_args_list],
             ["frame-failed", "frame-next"],
         )
+        self.assertEqual(result.total, 2)
+        self.assertEqual(result.prepared, 1)
+        self.assertEqual(result.failed, 1)
 
     def test_render_frame_image_ignores_not_georeferenced_warning_when_promoted_to_error(self) -> None:
         frame = cmi.CMIFrame(
