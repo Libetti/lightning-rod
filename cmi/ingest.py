@@ -112,6 +112,15 @@ class _FrameWarmupEntry:
     error: Exception | None = None
 
 
+@dataclass
+class _PrepareFramesResult:
+    total: int = 0
+    prepared: int = 0
+    skipped_cached: int = 0
+    skipped_retention: int = 0
+    failed: int = 0
+
+
 def _ensure_cache_dirs() -> None:
     for directory in (SOURCE_DIR, RASTER_DIR, IMAGE_DIR, METADATA_DIR):
         directory.mkdir(parents=True, exist_ok=True)
@@ -817,21 +826,50 @@ def _prepare_latest_frame(satellite: str) -> None:
         prepare_frame_with_tracking(frames[0])
 
 
-def _prepare_missing_frames(frames: list[CMIFrame]) -> None:
-    for frame in reversed(frames):
+def _prepare_missing_frames(
+    frames: list[CMIFrame],
+    progress_label: str | None = None,
+) -> _PrepareFramesResult:
+    result = _PrepareFramesResult(total=len(frames))
+    for index, frame in enumerate(reversed(frames), start=1):
         if not _frame_is_within_retention(frame):
+            result.skipped_retention += 1
             continue
         if has_frame(frame.satellite, frame.frame_id):
+            result.skipped_cached += 1
             continue
         try:
+            if progress_label is not None:
+                logger.info(
+                    "%s preparing frame %s/%s: satellite=%s frame_id=%s start_time=%s end_time=%s",
+                    progress_label,
+                    index,
+                    len(frames),
+                    frame.satellite,
+                    frame.frame_id,
+                    frame.start_time,
+                    frame.end_time,
+                )
             prepare_frame_with_tracking(frame)
+            result.prepared += 1
+            if progress_label is not None:
+                logger.info(
+                    "%s prepared frame %s/%s: satellite=%s frame_id=%s",
+                    progress_label,
+                    index,
+                    len(frames),
+                    frame.satellite,
+                    frame.frame_id,
+                )
         except CMIFetchError as exc:
+            result.failed += 1
             logger.warning(
                 "Skipping CMI frame after fetch failure: satellite=%s frame_id=%s error=%s",
                 frame.satellite,
                 frame.frame_id,
                 exc,
             )
+    return result
 
 
 def _poll_once() -> None:
@@ -868,8 +906,33 @@ def _warm_latest_then_poll_loop() -> None:
         if _poller_stop_event.is_set():
             return
         try:
+            logger.info(
+                "Starting CMI backfill: satellite=%s lookback_hours=%s",
+                satellite,
+                LOOKBACK_HOURS,
+            )
             frames = discover_recent_frames(satellite, lookback_hours=LOOKBACK_HOURS)
-            _prepare_missing_frames(frames)
+            logger.info(
+                "Discovered CMI backfill frames: satellite=%s count=%s oldest_start_time=%s newest_start_time=%s",
+                satellite,
+                len(frames),
+                frames[-1].start_time,
+                frames[0].start_time,
+            )
+            result = _prepare_missing_frames(
+                frames,
+                progress_label=f"CMI backfill for {satellite}",
+            )
+            logger.info(
+                "Finished CMI backfill: satellite=%s total=%s prepared=%s skipped_cached=%s "
+                "skipped_retention=%s failed=%s",
+                satellite,
+                result.total,
+                result.prepared,
+                result.skipped_cached,
+                result.skipped_retention,
+                result.failed,
+            )
         except CMIFetchError:
             logger.exception("Failed to backfill CMI history for %s", satellite)
         except Exception:
