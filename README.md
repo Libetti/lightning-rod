@@ -172,6 +172,8 @@ Supported CMI environment variables:
   Blur radius used when softening the alpha/coverage edge. Default: `2`.
 - `CMI_EDGE_SMOOTH_PASSES`
   Number of smoothing passes used on the coverage mask. Default: `2`.
+- `LOG_LEVEL`
+  Controls application logging verbosity, including CMI backfill progress logs. Default: `INFO`.
 
 Validation rules enforced at startup:
 

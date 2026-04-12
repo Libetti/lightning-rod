@@ -14,6 +14,21 @@ _installed = False
 _fault_log_file_handle = None
 
 
+def configure_logging() -> None:
+    """Configure application loggers so background worker INFO logs reach stderr."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        if handler.level == logging.NOTSET or handler.level > level:
+            handler.setLevel(level)
+
+
 def install_runtime_diagnostics() -> None:
     """Install process-wide crash diagnostics for uncaught and fatal errors."""
     global _installed, _fault_log_file_handle
