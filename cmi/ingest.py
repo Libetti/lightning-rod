@@ -29,21 +29,59 @@ from cmi.store import (
 
 logger = logging.getLogger(__name__)
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0, got {value}.")
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a float, got {raw!r}.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0, got {value}.")
+    return value
+
+
 SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "3600"))
-LOOKBACK_HOURS = int(os.getenv("CMI_LOOKBACK_HOURS", "48"))
-INCREMENTAL_LOOKBACK_HOURS = int(os.getenv("CMI_INCREMENTAL_LOOKBACK_HOURS", "3"))
+POLL_INTERVAL_SECONDS = _env_positive_int("CMI_POLL_INTERVAL_SECONDS", 3600)
+LOOKBACK_HOURS = _env_positive_int("CMI_LOOKBACK_HOURS", 48)
+INCREMENTAL_LOOKBACK_HOURS = _env_positive_int("CMI_INCREMENTAL_LOOKBACK_HOURS", 3)
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
-TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
-TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
-EDGE_SMOOTH_RADIUS = int(os.getenv("CMI_EDGE_SMOOTH_RADIUS", "2"))
-EDGE_SMOOTH_PASSES = int(os.getenv("CMI_EDGE_SMOOTH_PASSES", "2"))
+TEMP_VISIBLE_CLOUD_K = _env_positive_float("CMI_VISIBLE_CLOUD_TEMP_K", 270.0)
+TEMP_DENSE_CLOUD_K = _env_positive_float("CMI_DENSE_CLOUD_TEMP_K", 235.0)
+EDGE_SMOOTH_RADIUS = _env_positive_int("CMI_EDGE_SMOOTH_RADIUS", 2)
+EDGE_SMOOTH_PASSES = _env_positive_int("CMI_EDGE_SMOOTH_PASSES", 2)
 
-CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
+if INCREMENTAL_LOOKBACK_HOURS > LOOKBACK_HOURS:
+    raise RuntimeError(
+        "CMI_INCREMENTAL_LOOKBACK_HOURS must be <= CMI_LOOKBACK_HOURS. "
+        f"Got {INCREMENTAL_LOOKBACK_HOURS} > {LOOKBACK_HOURS}."
+    )
+if TEMP_DENSE_CLOUD_K >= TEMP_VISIBLE_CLOUD_K:
+    raise RuntimeError(
+        "CMI_DENSE_CLOUD_TEMP_K must be lower than CMI_VISIBLE_CLOUD_TEMP_K. "
+        f"Got {TEMP_DENSE_CLOUD_K} >= {TEMP_VISIBLE_CLOUD_K}."
+    )
+
+CMI_CACHE_DIR = Path(os.getenv("CMI_CACHE_DIR", str(Path(gettempdir()) / "lightning_rod_cmi")))
 SOURCE_DIR = CMI_CACHE_DIR / "source"
 RASTER_DIR = CMI_CACHE_DIR / "rasters"
 IMAGE_DIR = CMI_CACHE_DIR / "images"

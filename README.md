@@ -103,11 +103,14 @@ Example `GET /lightning/latest-points` response:
 
 - Satellites supported: `goes-east`, `goes-west`
 - Coverage: full disk (`ABI-L2-CMIPF`, channel/band 13)
-- Polling: call `/imagery/cmi/ch13/frames` every ~10 seconds; advance animation only when a new `frame_id` appears
+- The server maintains a rolling rendered archive and serves frame metadata by explicit time window
+- Startup behavior: warm the latest frame first, then backfill the last configured archive window in the background
+- Refresh behavior: poll NOAA on a fixed interval and add only missing frames inside the incremental lookback window
 - Frames include `image_url` plus exactly four `coordinates` in top-left, top-right, bottom-right, bottom-left order for a MapLibre `ImageSource`
 - `GET /imagery/cmi/ch13/images/{satellite}/{frame_id}.png` returns `image/png`
 - Image placement is a practical EPSG:4326 approximation for globe rendering, not a native GOES geostationary renderer
-- Image cache: on-demand render and disk cache under temp dir (`/tmp/lightning_rod_cmi`), retained for ~2 hours
+- Render cache lives under `CMI_CACHE_DIR` and is pruned by frame timestamp, not file mtime
+- `GET /imagery/cmi/ch13/frames` now requires `start` and `end`
 
 Example `GET /imagery/cmi/ch13/frames` response:
 
@@ -115,7 +118,7 @@ Example `GET /imagery/cmi/ch13/frames` response:
 {
   "satellite": "goes-east",
   "count": 1,
-  "poll_interval_seconds": 30,
+  "poll_interval_seconds": 3600,
   "frames": [
     {
       "frame_id": "OR_ABI-L2-CMIPF-M6C13_G19_s20260942240173_e20260942249481_c20260942249529",
@@ -132,4 +135,76 @@ Example `GET /imagery/cmi/ch13/frames` response:
     }
   ]
 }
+```
+
+Example request for a one-hour playback window:
+
+```text
+GET /imagery/cmi/ch13/frames?satellite=goes-east&start=2026-04-08T00:00:00Z&end=2026-04-08T01:00:00Z
+```
+
+Recommended client flow:
+
+1. Fetch 48 hours of metadata once with `start` and `end`.
+2. Build the animation timeline from the returned `start_time` values.
+3. Fetch PNGs progressively in 1-hour windows around the playhead.
+4. Evict image assets behind the playhead while retaining metadata for the full session.
+
+## CMI Configuration
+
+Supported CMI environment variables:
+
+- `CMI_POLL_INTERVAL_SECONDS`
+  Controls how often the background poller checks NOAA for new frames. Default: `3600`.
+- `CMI_LOOKBACK_HOURS`
+  Controls the startup backfill window. Default: `48`.
+- `CMI_INCREMENTAL_LOOKBACK_HOURS`
+  Controls the recent-history window used during each poll cycle to catch newly published frames. Default: `3`.
+- `CMI_RETENTION_HOURS`
+  Controls how much rendered CMI history is retained in memory and on disk. Default: `48`.
+- `CMI_CACHE_DIR`
+  Optional override for the rendered CMI cache root. Default: system temp dir + `lightning_rod_cmi`.
+- `CMI_VISIBLE_CLOUD_TEMP_K`
+  Upper temperature bound used by the cloud brightness transform. Default: `270.0`.
+- `CMI_DENSE_CLOUD_TEMP_K`
+  Lower temperature bound used by the cloud brightness transform. Default: `235.0`.
+- `CMI_EDGE_SMOOTH_RADIUS`
+  Blur radius used when softening the alpha/coverage edge. Default: `2`.
+- `CMI_EDGE_SMOOTH_PASSES`
+  Number of smoothing passes used on the coverage mask. Default: `2`.
+
+Validation rules enforced at startup:
+
+- `CMI_POLL_INTERVAL_SECONDS`, `CMI_LOOKBACK_HOURS`, `CMI_INCREMENTAL_LOOKBACK_HOURS`, `CMI_RETENTION_HOURS`, `CMI_EDGE_SMOOTH_RADIUS`, and `CMI_EDGE_SMOOTH_PASSES` must be positive integers.
+- `CMI_VISIBLE_CLOUD_TEMP_K` and `CMI_DENSE_CLOUD_TEMP_K` must be positive floats.
+- `CMI_INCREMENTAL_LOOKBACK_HOURS` must be less than or equal to `CMI_LOOKBACK_HOURS`.
+- `CMI_DENSE_CLOUD_TEMP_K` must be lower than `CMI_VISIBLE_CLOUD_TEMP_K`.
+
+Suggested production-like settings for a 48-hour archive:
+
+```bash
+export CMI_POLL_INTERVAL_SECONDS=3600
+export CMI_LOOKBACK_HOURS=48
+export CMI_INCREMENTAL_LOOKBACK_HOURS=3
+export CMI_RETENTION_HOURS=48
+```
+
+## CMI Operational Validation
+
+Use this checklist after changing CMI ingest or deploying a new environment:
+
+1. Start the app and confirm it serves `/health` immediately.
+2. Wait for the latest-frame warmup, then request a recent 1-hour window from `/imagery/cmi/ch13/frames`.
+3. Confirm the response is ordered oldest-to-newest and each frame has `image_url` plus four `coordinates`.
+4. Open one returned `image_url` and verify the PNG is served with a long-lived cache header.
+5. After the background backfill finishes, request a wider window and confirm older frames are present.
+6. Inspect `CMI_CACHE_DIR` and verify `images/`, `metadata/`, and any retained source files are being populated.
+7. Let the process run past one poll interval and confirm only new frames are added.
+8. Verify assets older than `CMI_RETENTION_HOURS` are removed from both the in-memory index and disk cache.
+
+Useful manual checks:
+
+```bash
+curl "http://127.0.0.1:8000/imagery/cmi/ch13/frames?satellite=goes-east&start=2026-04-08T00:00:00Z&end=2026-04-08T01:00:00Z"
+find "${CMI_CACHE_DIR:-${TMPDIR:-/tmp}/lightning_rod_cmi}" -type f | head
 ```

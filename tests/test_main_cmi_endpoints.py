@@ -39,10 +39,18 @@ class MainCMIEndpointTests(unittest.TestCase):
         schema = main.app.openapi()
 
         image_route = schema["paths"]["/imagery/cmi/ch13/images/{satellite}/{frame_id}.png"]["get"]
+        frames_route = schema["paths"]["/imagery/cmi/ch13/frames"]["get"]
         frame_schema = schema["components"]["schemas"]["CMIFrameModel"]
+        frames_response_schema = schema["components"]["schemas"]["CMIFramesResponse"]
         coordinates_schema = frame_schema["properties"]["coordinates"]
+        frame_params = {param["name"]: param for param in frames_route["parameters"]}
 
         self.assertIn("image/png", image_route["responses"]["200"]["content"])
+        self.assertEqual(frames_route["summary"], "Get CMI Frames For A Time Window")
+        self.assertTrue(frame_params["start"]["required"])
+        self.assertTrue(frame_params["end"]["required"])
+        self.assertIn("oldest-to-newest", frames_route["description"])
+        self.assertIn("oldest-to-newest", frames_response_schema["properties"]["frames"]["description"])
         self.assertEqual(coordinates_schema["minItems"], 4)
         self.assertEqual(coordinates_schema["maxItems"], 4)
         self.assertIn("top-left", coordinates_schema["description"])

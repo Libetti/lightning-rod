@@ -6,9 +6,23 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0, got {value}.")
+    return value
+
+
 FRAMES_CACHE_TTL_SECONDS = 30
-POLL_INTERVAL_HINT_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "3600"))
-FRAME_RETENTION_HOURS = int(os.getenv("CMI_RETENTION_HOURS", "48"))
+POLL_INTERVAL_HINT_SECONDS = _env_positive_int("CMI_POLL_INTERVAL_SECONDS", 3600)
+FRAME_RETENTION_HOURS = _env_positive_int("CMI_RETENTION_HOURS", 48)
 
 
 class CMIFetchError(Exception):
