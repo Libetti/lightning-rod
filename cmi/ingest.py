@@ -17,6 +17,7 @@ from urllib.request import urlretrieve
 import numpy as np
 from netCDF4 import Dataset
 
+from app.native_locks import NETCDF_LOCK
 from cmi.store import (
     CMIFrame,
     CMIFetchError,
@@ -362,12 +363,24 @@ def discover_recent_frames(satellite: str, lookback_hours: int = LOOKBACK_HOURS)
     return frames
 
 
-def _download_from_public_bucket(s3_key: str) -> Path:
+def _public_bucket_s3_key(file_ref: str) -> str | None:
+    s3_key = file_ref.removeprefix("s3://")
+    if s3_key.startswith("noaa-goes") and "/" in s3_key:
+        return s3_key
+    return None
+
+
+def _download_from_public_bucket(s3_key: str, refresh: bool = False) -> Path:
     bucket, key = s3_key.split("/", 1)
     local_path = SOURCE_DIR / bucket / key
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    if local_path.exists():
+    if local_path.exists() and not refresh:
         return local_path
+    if refresh:
+        try:
+            local_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove cached CMI source before refresh: %s", local_path, exc_info=True)
 
     url = f"https://{bucket}.s3.amazonaws.com/{key}"
     last_error: Exception | None = None
@@ -397,20 +410,42 @@ def _download_from_public_bucket(s3_key: str) -> Path:
     raise CMIFetchError(f"Unable to download CMI file from NOAA: {last_error}") from last_error
 
 
-def materialize_file(file_ref: str) -> Path:
+def materialize_file(file_ref: str, refresh: bool = False) -> Path:
     local = Path(file_ref)
-    if local.exists():
+    if local.exists() and not refresh:
         return local
 
-    s3_key = file_ref.removeprefix("s3://")
-    if s3_key.startswith("noaa-goes") and "/" in s3_key:
-        return _download_from_public_bucket(s3_key=s3_key)
+    s3_key = _public_bucket_s3_key(file_ref)
+    if s3_key is not None:
+        return _download_from_public_bucket(s3_key=s3_key, refresh=refresh)
 
     temp_relative = Path(gettempdir()) / file_ref
-    if temp_relative.exists():
+    if temp_relative.exists() and not refresh:
         return temp_relative
 
     raise CMIFetchError(f"goes2go did not return a usable CMI file path: {file_ref}")
+
+
+def _read_cmi_values(nc_path: Path) -> tuple[np.ndarray, float | None]:
+    with NETCDF_LOCK:
+        ds = None
+        try:
+            ds = Dataset(str(nc_path), mode="r")
+            cmi_var = ds.variables["CMI"]
+            cmi_data = cmi_var[:]
+            if isinstance(cmi_data, np.ma.MaskedArray):
+                values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
+            else:
+                values = np.asarray(cmi_data, dtype=np.float32)
+            fill_value = getattr(cmi_var, "_FillValue", None)
+            return values, fill_value
+        except KeyError as exc:
+            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
+        except OSError as exc:
+            raise CMIFetchError(f"Unable to read CMI file with netCDF4: {nc_path}: {exc}") from exc
+        finally:
+            if ds is not None:
+                ds.close()
 
 
 def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[object, object]:
@@ -418,34 +453,39 @@ def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[o
     from rasterio.crs import CRS
     from rasterio.transform import from_bounds
 
-    ds = Dataset(str(nc_path), mode="r")
-    try:
-        projection = ds.variables["goes_imager_projection"]
-        sat_height = float(projection.perspective_point_height)
-        semi_major = float(projection.semi_major_axis)
-        semi_minor = float(projection.semi_minor_axis)
-        lon_0 = float(projection.longitude_of_projection_origin)
-        sweep = str(getattr(projection, "sweep_angle_axis", "x"))
+    with NETCDF_LOCK:
+        ds = None
+        try:
+            ds = Dataset(str(nc_path), mode="r")
+            projection = ds.variables["goes_imager_projection"]
+            sat_height = float(projection.perspective_point_height)
+            semi_major = float(projection.semi_major_axis)
+            semi_minor = float(projection.semi_minor_axis)
+            lon_0 = float(projection.longitude_of_projection_origin)
+            sweep = str(getattr(projection, "sweep_angle_axis", "x"))
 
-        x = np.asarray(ds.variables["x"][:], dtype=np.float64) * sat_height
-        y = np.asarray(ds.variables["y"][:], dtype=np.float64) * sat_height
+            x = np.asarray(ds.variables["x"][:], dtype=np.float64) * sat_height
+            y = np.asarray(ds.variables["y"][:], dtype=np.float64) * sat_height
 
-        transform = from_bounds(
-            float(np.min(x)),
-            float(np.min(y)),
-            float(np.max(x)),
-            float(np.max(y)),
-            width,
-            height,
-        )
-        crs = CRS.from_proj4(
-            f"+proj=geos +h={sat_height} +lon_0={lon_0} +a={semi_major} +b={semi_minor} +sweep={sweep} +no_defs"
-        )
-        return crs, transform
-    except KeyError as exc:
-        raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
-    finally:
-        ds.close()
+            transform = from_bounds(
+                float(np.min(x)),
+                float(np.min(y)),
+                float(np.max(x)),
+                float(np.max(y)),
+                width,
+                height,
+            )
+            crs = CRS.from_proj4(
+                f"+proj=geos +h={sat_height} +lon_0={lon_0} +a={semi_major} +b={semi_minor} +sweep={sweep} +no_defs"
+            )
+            return crs, transform
+        except KeyError as exc:
+            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
+        except OSError as exc:
+            raise CMIFetchError(f"Unable to read CMI projection with netCDF4: {nc_path}: {exc}") from exc
+        finally:
+            if ds is not None:
+                ds.close()
 
 
 def _valid_cmi_mask(cmi_values: np.ndarray, fill_value: float | None) -> np.ndarray:
@@ -505,6 +545,10 @@ def frame_metadata_path(satellite: str, frame_id: str) -> Path:
     return METADATA_DIR / satellite / f"{frame_id}.json"
 
 
+def _source_can_refresh(file_ref: str, error: CMIFetchError) -> bool:
+    return _public_bucket_s3_key(file_ref) is not None and isinstance(error.__cause__, OSError)
+
+
 def build_frame_raster(frame: CMIFrame) -> Path:
     _ensure_cache_dirs()
     raster_path = frame_raster_path(satellite=frame.satellite, frame_id=frame.frame_id)
@@ -516,25 +560,33 @@ def build_frame_raster(frame: CMIFrame) -> Path:
         if raster_path.exists():
             return raster_path
 
-        source_path = materialize_file(frame.file_ref)
-        ds = Dataset(str(source_path), mode="r")
-        try:
-            cmi_var = ds.variables["CMI"]
-            cmi_data = cmi_var[:]
-            if isinstance(cmi_data, np.ma.MaskedArray):
-                values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
-            else:
-                values = np.asarray(cmi_data, dtype=np.float32)
-            fill_value = getattr(cmi_var, "_FillValue", None)
-        except KeyError as exc:
-            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
-        finally:
-            ds.close()
+        last_error: CMIFetchError | None = None
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                source_path = materialize_file(frame.file_ref, refresh=attempt > 1)
+                values, fill_value = _read_cmi_values(source_path)
+                height, width = values.shape
+                crs, transform = _projection_and_transform(source_path, width=width, height=height)
+                break
+            except CMIFetchError as exc:
+                last_error = exc
+                if attempt >= DOWNLOAD_ATTEMPTS or not _source_can_refresh(frame.file_ref, exc):
+                    raise
+                logger.warning(
+                    "Refreshing cached CMI source after netCDF read failure: "
+                    "satellite=%s frame_id=%s attempt=%s/%s error=%s",
+                    frame.satellite,
+                    frame.frame_id,
+                    attempt,
+                    DOWNLOAD_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+        else:
+            raise CMIFetchError(f"Unable to read CMI source: {last_error}") from last_error
 
         gray, alpha = _cmi_to_grayscale(values, fill_value=fill_value)
         coverage = np.where(_valid_cmi_mask(values, fill_value=fill_value), 255, 0).astype(np.uint8)
-        height, width = gray.shape
-        crs, transform = _projection_and_transform(source_path, width=width, height=height)
 
         raster_path.parent.mkdir(parents=True, exist_ok=True)
         profile = {

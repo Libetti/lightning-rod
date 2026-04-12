@@ -11,6 +11,7 @@ import numpy as np
 
 from cmi import ingest as cmi
 from cmi import service as cmi_service
+from glm import ingest as glm_ingest
 
 
 class CMIUnitTests(unittest.TestCase):
@@ -39,6 +40,9 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(len(frames), 2)
         self.assertEqual(frames[0].satellite, "goes-east")
         self.assertGreater(frames[0].start_time, frames[1].start_time)
+
+    def test_cmi_and_glm_share_netcdf_lock(self) -> None:
+        self.assertIs(cmi.NETCDF_LOCK, glm_ingest.NETCDF_LOCK)
 
     def test_store_keeps_recent_frames_sorted_by_frame_time_after_backfill(self) -> None:
         from cmi import store
@@ -314,6 +318,37 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(downloaded, b"nc")
         self.assertEqual(len(calls), 2)
         sleep_mock.assert_called_once_with(cmi.DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    def test_materialize_file_refresh_replaces_existing_public_bucket_cache(self) -> None:
+        calls: list[str] = []
+
+        def _fake_urlretrieve(url: str, filename: str) -> tuple[str, None]:
+            calls.append(url)
+            Path(filename).write_bytes(b"fresh")
+            return filename, None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir) / "source"
+            cached = source_dir / "noaa-goes19" / "path" / "frame.nc"
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"corrupt")
+
+            with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(
+                cmi, "urlretrieve", side_effect=_fake_urlretrieve
+            ):
+                path = cmi.materialize_file("s3://noaa-goes19/path/frame.nc", refresh=True)
+                downloaded = path.read_bytes()
+
+        self.assertEqual(downloaded, b"fresh")
+        self.assertEqual(len(calls), 1)
+
+    def test_read_cmi_values_wraps_netcdf_os_errors(self) -> None:
+        with patch.object(cmi, "Dataset", side_effect=OSError("NetCDF: HDF error")):
+            with self.assertRaises(cmi.CMIFetchError) as ctx:
+                cmi._read_cmi_values(Path("/tmp/corrupt.nc"))
+
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertIn("Unable to read CMI file", str(ctx.exception))
 
     def test_prepare_missing_frames_skips_failed_frame_and_continues(self) -> None:
         failed = cmi.CMIFrame(
