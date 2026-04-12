@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import threading
 import unittest
@@ -12,6 +11,7 @@ import numpy as np
 
 from cmi import ingest as cmi
 from cmi import service as cmi_service
+from glm import ingest as glm_ingest
 
 
 class CMIUnitTests(unittest.TestCase):
@@ -41,6 +41,9 @@ class CMIUnitTests(unittest.TestCase):
         self.assertEqual(frames[0].satellite, "goes-east")
         self.assertGreater(frames[0].start_time, frames[1].start_time)
 
+    def test_cmi_and_glm_share_netcdf_lock(self) -> None:
+        self.assertIs(cmi.NETCDF_LOCK, glm_ingest.NETCDF_LOCK)
+
     def test_store_keeps_recent_frames_sorted_by_frame_time_after_backfill(self) -> None:
         from cmi import store
 
@@ -59,11 +62,19 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-older.nc",
         )
 
-        store.store_prepared_frame(newest)
-        store.store_prepared_frame(older)
+        with patch("cmi.store.datetime") as datetime_mock:
+            datetime_mock.now.return_value = cmi.datetime(2026, 4, 6, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
+            store.store_prepared_frame(newest)
+            store.store_prepared_frame(older)
 
-        frames = store.get_recent_frames("goes-east", limit=2)
-        latest, _ = store.get_latest_frame("goes-east")
+            frames = store.get_frames_in_range(
+                "goes-east",
+                start="2026-04-06T09:00:00Z",
+                end="2026-04-06T11:00:00Z",
+                limit=2,
+            )
+            latest, _ = store.get_latest_frame("goes-east")
 
         self.assertEqual([frame.frame_id for frame in frames], ["frame-newest", "frame-older"])
         self.assertEqual(latest.frame_id, "frame-newest")
@@ -80,23 +91,57 @@ class CMIUnitTests(unittest.TestCase):
             image_dir.mkdir(parents=True)
             metadata_dir.mkdir(parents=True)
 
-            old_file = source_dir / "old.nc"
-            fresh_file = image_dir / "fresh.png"
+            old_file = (
+                source_dir
+                / "OR_ABI-L2-CMIPF-M6C13_G19_s20260010000000_e20260010009599_c20260010010000.nc"
+            )
+            fresh_file = (
+                image_dir
+                / "OR_ABI-L2-CMIPF-M6C13_G19_s20261000000000_e20261000009599_c20261000010000.png"
+            )
             old_file.write_bytes(b"old")
             fresh_file.write_bytes(b"fresh")
 
-            old_epoch = 1000
-            fresh_epoch = 3000
-
             with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(cmi, "RASTER_DIR", raster_dir), patch.object(
                 cmi, "IMAGE_DIR", image_dir
-            ), patch.object(cmi, "METADATA_DIR", metadata_dir), patch.object(cmi, "time", return_value=4000):
-                os.utime(old_file, (old_epoch, old_epoch))
-                os.utime(fresh_file, (fresh_epoch, fresh_epoch))
-                cmi.cleanup_stale_cache(retention_seconds=1500)
+            ), patch.object(cmi, "METADATA_DIR", metadata_dir):
+                cmi.cleanup_stale_cache(now=cmi.datetime(2026, 4, 10, tzinfo=cmi.timezone.utc))
 
             self.assertFalse(old_file.exists())
             self.assertTrue(fresh_file.exists())
+
+    def test_store_prunes_frames_older_than_retention_window(self) -> None:
+        from cmi import store
+
+        fresh = cmi.CMIFrame(
+            frame_id="fresh-frame",
+            satellite="goes-east",
+            start_time="2026-04-09T10:00:00Z",
+            end_time="2026-04-09T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/fresh-frame.nc",
+        )
+        stale = cmi.CMIFrame(
+            frame_id="stale-frame",
+            satellite="goes-east",
+            start_time="2026-04-06T09:00:00Z",
+            end_time="2026-04-06T09:09:59Z",
+            file_ref="s3://noaa-goes19/path/stale-frame.nc",
+        )
+
+        with patch("cmi.store.datetime") as datetime_mock:
+            datetime_mock.now.return_value = cmi.datetime(2026, 4, 10, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
+            store.store_prepared_frame(stale)
+            store.store_prepared_frame(fresh)
+
+            frames = store.get_frames_in_range(
+                "goes-east",
+                start="2026-04-08T00:00:00Z",
+                end="2026-04-10T00:00:00Z",
+                limit=10,
+            )
+
+        self.assertEqual([frame.frame_id for frame in frames], ["fresh-frame"])
 
     def test_render_frame_image_returns_cached_file_without_rendering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -157,17 +202,21 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
 
-        with patch.object(cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")), patch.object(
+        with patch("cmi.store.datetime") as datetime_mock, patch.object(
+            cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")
+        ), patch.object(
             cmi,
             "render_frame_image",
             return_value=(Path("/tmp/frame-1.png"), [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]]),
         ):
+            datetime_mock.now.return_value = cmi.datetime(2026, 3, 16, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
             prepared = cmi.prepare_frame(frame)
 
-        from cmi import store
+            from cmi import store
 
-        self.assertEqual(prepared, frame)
-        self.assertTrue(store.has_frame("goes-east", "frame-1"))
+            self.assertEqual(prepared, frame)
+            self.assertTrue(store.has_frame("goes-east", "frame-1"))
 
     def test_get_prepared_image_artifacts_renders_on_demand(self) -> None:
         frame = cmi.CMIFrame(
@@ -180,15 +229,18 @@ class CMIUnitTests(unittest.TestCase):
 
         from cmi import store
 
-        store.store_prepared_frame(frame)
+        with patch("cmi.store.datetime") as datetime_mock:
+            datetime_mock.now.return_value = cmi.datetime(2026, 3, 16, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
+            store.store_prepared_frame(frame)
 
-        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
-        image_path = Path("/tmp/frame-1.png")
-        with patch.object(cmi, "render_frame_image", return_value=(image_path, coordinates)) as render_mock:
-            resolved, actual_coordinates = cmi.get_prepared_image_artifacts(
-                satellite="goes-east",
-                frame_id="frame-1",
-            )
+            coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
+            image_path = Path("/tmp/frame-1.png")
+            with patch.object(cmi, "render_frame_image", return_value=(image_path, coordinates)) as render_mock:
+                resolved, actual_coordinates = cmi.get_prepared_image_artifacts(
+                    satellite="goes-east",
+                    frame_id="frame-1",
+                )
 
         self.assertEqual(resolved, image_path)
         self.assertEqual(actual_coordinates, coordinates)
@@ -239,9 +291,94 @@ class CMIUnitTests(unittest.TestCase):
             with patch.object(cmi, "gettempdir", return_value=tmp_dir), patch.object(
                 cmi, "SOURCE_DIR", root / "source"
             ), patch.object(cmi, "_load_goes_timerange", side_effect=RuntimeError("network down")):
-                file_refs = cmi._list_recent_cmi_file_refs(19)
+                file_refs = cmi._list_recent_cmi_file_refs(19, recent_window="48h")
 
         self.assertEqual(file_refs, [str(cached)])
+
+    def test_download_from_public_bucket_retries_connection_reset(self) -> None:
+        calls: list[str] = []
+
+        def _fake_urlretrieve(url: str, filename: str) -> tuple[str, None]:
+            calls.append(url)
+            if len(calls) == 1:
+                Path(filename).write_bytes(b"partial")
+                raise ConnectionResetError("reset by peer")
+            Path(filename).write_bytes(b"nc")
+            return filename, None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir) / "source"
+            with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(
+                cmi, "urlretrieve", side_effect=_fake_urlretrieve
+            ), patch.object(cmi.time, "sleep") as sleep_mock:
+                path = cmi._download_from_public_bucket("noaa-goes19/path/frame.nc")
+                downloaded = path.read_bytes()
+
+        self.assertEqual(path.name, "frame.nc")
+        self.assertEqual(downloaded, b"nc")
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(cmi.DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    def test_materialize_file_refresh_replaces_existing_public_bucket_cache(self) -> None:
+        calls: list[str] = []
+
+        def _fake_urlretrieve(url: str, filename: str) -> tuple[str, None]:
+            calls.append(url)
+            Path(filename).write_bytes(b"fresh")
+            return filename, None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir) / "source"
+            cached = source_dir / "noaa-goes19" / "path" / "frame.nc"
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"corrupt")
+
+            with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(
+                cmi, "urlretrieve", side_effect=_fake_urlretrieve
+            ):
+                path = cmi.materialize_file("s3://noaa-goes19/path/frame.nc", refresh=True)
+                downloaded = path.read_bytes()
+
+        self.assertEqual(downloaded, b"fresh")
+        self.assertEqual(len(calls), 1)
+
+    def test_read_cmi_values_wraps_netcdf_os_errors(self) -> None:
+        with patch.object(cmi, "Dataset", side_effect=OSError("NetCDF: HDF error")):
+            with self.assertRaises(cmi.CMIFetchError) as ctx:
+                cmi._read_cmi_values(Path("/tmp/corrupt.nc"))
+
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertIn("Unable to read CMI file", str(ctx.exception))
+
+    def test_prepare_missing_frames_skips_failed_frame_and_continues(self) -> None:
+        failed = cmi.CMIFrame(
+            frame_id="frame-failed",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-failed.nc",
+        )
+        next_frame = cmi.CMIFrame(
+            frame_id="frame-next",
+            satellite="goes-east",
+            start_time="2026-03-16T10:10:00Z",
+            end_time="2026-03-16T10:19:59Z",
+            file_ref="s3://noaa-goes19/path/frame-next.nc",
+        )
+
+        with patch.object(cmi, "_frame_is_within_retention", return_value=True), patch.object(
+            cmi, "has_frame", return_value=False
+        ), patch.object(
+            cmi,
+            "prepare_frame_with_tracking",
+            side_effect=[cmi.CMIFetchError("reset by peer"), next_frame],
+        ) as prepare_mock:
+            cmi._prepare_missing_frames([next_frame, failed])
+
+        self.assertEqual(
+            [call.args[0].frame_id for call in prepare_mock.call_args_list],
+            ["frame-failed", "frame-next"],
+        )
 
     def test_render_frame_image_ignores_not_georeferenced_warning_when_promoted_to_error(self) -> None:
         frame = cmi.CMIFrame(
@@ -403,7 +540,7 @@ class CMIUnitTests(unittest.TestCase):
         with cmi._frame_warmups_guard:
             self.assertEqual(cmi._frame_warmups, {})
 
-    def test_service_get_recent_frames_reads_cache_only(self) -> None:
+    def test_service_get_frames_in_range_reads_cache_only(self) -> None:
         frame = cmi.CMIFrame(
             frame_id="frame-1",
             satellite="goes-east",
@@ -412,13 +549,23 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
 
-        with patch.object(cmi_service.store, "get_recent_frames", return_value=[frame]) as get_recent_mock, patch.object(
+        with patch.object(cmi_service.store, "get_frames_in_range", return_value=[frame]) as get_range_mock, patch.object(
             cmi_service.ingest, "discover_recent_frames", side_effect=AssertionError("request path should not discover")
         ):
-            frames = cmi_service.get_recent_frames(satellite="goes-east", limit=12)
+            frames = cmi_service.get_frames_in_range(
+                satellite="goes-east",
+                start="2026-03-16T10:00:00Z",
+                end="2026-03-16T11:00:00Z",
+                limit=12,
+            )
 
         self.assertEqual(frames, [frame])
-        get_recent_mock.assert_called_once_with(satellite="goes-east", limit=12)
+        get_range_mock.assert_called_once_with(
+            satellite="goes-east",
+            start="2026-03-16T10:00:00Z",
+            end="2026-03-16T11:00:00Z",
+            limit=12,
+        )
 
     def test_service_get_image_artifacts_waits_for_in_progress_warmup(self) -> None:
         image_path = Path("/tmp/frame-1.png")

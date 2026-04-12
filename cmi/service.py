@@ -14,8 +14,13 @@ _frames_by_satellite = store._frames_by_satellite
 _poller_stop_event = ingest._poller_stop_event
 
 
-def get_recent_frames(satellite: str = "goes-east", limit: int = 12) -> list[CMIFrame]:
-    return store.get_recent_frames(satellite=satellite, limit=limit)
+def get_frames_in_range(
+    satellite: str = "goes-east",
+    start: str = "",
+    end: str = "",
+    limit: int = 1000,
+) -> list[CMIFrame]:
+    return store.get_frames_in_range(satellite=satellite, start=start, end=end, limit=limit)
 
 
 def get_image_artifacts(frame_id: str, satellite: str) -> tuple[Path, list[list[float]]]:

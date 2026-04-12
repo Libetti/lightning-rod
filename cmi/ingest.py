@@ -4,46 +4,88 @@ import json
 import logging
 import os
 import re
+import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
 from threading import Event, Lock, Thread
-from time import time
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
 import numpy as np
 from netCDF4 import Dataset
 
+from app.native_locks import NETCDF_LOCK
 from cmi.store import (
     CMIFrame,
     CMIFetchError,
     CMIFrameNotFoundError,
-    FRAME_RETENTION_COUNT,
+    FRAME_RETENTION_HOURS,
     get_frame,
     has_frame,
+    prune_expired_frames,
     store_prepared_frame,
 )
 
 logger = logging.getLogger(__name__)
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0, got {value}.")
+    return value
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a float, got {raw!r}.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0, got {value}.")
+    return value
+
+
 SATELLITE_TO_ID = {
     "goes-east": 19,
     "goes-west": 18,
 }
-POLL_INTERVAL_SECONDS = int(os.getenv("CMI_POLL_INTERVAL_SECONDS", "30"))
-FRAME_LOOKBACK = "4h"
+POLL_INTERVAL_SECONDS = _env_positive_int("CMI_POLL_INTERVAL_SECONDS", 3600)
+LOOKBACK_HOURS = _env_positive_int("CMI_LOOKBACK_HOURS", 48)
+INCREMENTAL_LOOKBACK_HOURS = _env_positive_int("CMI_INCREMENTAL_LOOKBACK_HOURS", 3)
 TEMP_COLD_K = 180.0
 TEMP_WARM_K = 320.0
-TEMP_VISIBLE_CLOUD_K = float(os.getenv("CMI_VISIBLE_CLOUD_TEMP_K", "270.0"))
-TEMP_DENSE_CLOUD_K = float(os.getenv("CMI_DENSE_CLOUD_TEMP_K", "235.0"))
-FRAME_RETENTION_SECONDS = 2 * 60 * 60
-EDGE_SMOOTH_RADIUS = int(os.getenv("CMI_EDGE_SMOOTH_RADIUS", "2"))
-EDGE_SMOOTH_PASSES = int(os.getenv("CMI_EDGE_SMOOTH_PASSES", "2"))
+TEMP_VISIBLE_CLOUD_K = _env_positive_float("CMI_VISIBLE_CLOUD_TEMP_K", 270.0)
+TEMP_DENSE_CLOUD_K = _env_positive_float("CMI_DENSE_CLOUD_TEMP_K", 235.0)
+EDGE_SMOOTH_RADIUS = _env_positive_int("CMI_EDGE_SMOOTH_RADIUS", 2)
+EDGE_SMOOTH_PASSES = _env_positive_int("CMI_EDGE_SMOOTH_PASSES", 2)
+DOWNLOAD_ATTEMPTS = _env_positive_int("CMI_DOWNLOAD_ATTEMPTS", 3)
+DOWNLOAD_RETRY_DELAY_SECONDS = _env_positive_float("CMI_DOWNLOAD_RETRY_DELAY_SECONDS", 1.0)
 
-CMI_CACHE_DIR = Path(gettempdir()) / "lightning_rod_cmi"
+if INCREMENTAL_LOOKBACK_HOURS > LOOKBACK_HOURS:
+    raise RuntimeError(
+        "CMI_INCREMENTAL_LOOKBACK_HOURS must be <= CMI_LOOKBACK_HOURS. "
+        f"Got {INCREMENTAL_LOOKBACK_HOURS} > {LOOKBACK_HOURS}."
+    )
+if TEMP_DENSE_CLOUD_K >= TEMP_VISIBLE_CLOUD_K:
+    raise RuntimeError(
+        "CMI_DENSE_CLOUD_TEMP_K must be lower than CMI_VISIBLE_CLOUD_TEMP_K. "
+        f"Got {TEMP_DENSE_CLOUD_K} >= {TEMP_VISIBLE_CLOUD_K}."
+    )
+
+CMI_CACHE_DIR = Path(os.getenv("CMI_CACHE_DIR", str(Path(gettempdir()) / "lightning_rod_cmi")))
 SOURCE_DIR = CMI_CACHE_DIR / "source"
 RASTER_DIR = CMI_CACHE_DIR / "rasters"
 IMAGE_DIR = CMI_CACHE_DIR / "images"
@@ -209,7 +251,24 @@ def wait_for_frame_warmup(satellite: str, frame_id: str) -> CMIFrame:
     return entry.frame
 
 
-def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
+def _iso_to_utc_datetime(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _retention_cutoff(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    return current - timedelta(hours=FRAME_RETENTION_HOURS)
+
+
+def _frame_is_within_retention(frame: CMIFrame, now: datetime | None = None) -> bool:
+    return _iso_to_utc_datetime(frame.start_time) >= _retention_cutoff(now=now)
+
+
+def _lookback_window(hours: int) -> str:
+    return f"{max(int(hours), 1)}h"
+
+
+def _list_recent_cmi_file_refs(satellite_id: int, recent_window: str) -> list[str]:
     local_refs = _local_cmi_file_refs(satellite_id=satellite_id)
     try:
         goes_timerange = _load_goes_timerange()
@@ -218,7 +277,7 @@ def _list_recent_cmi_file_refs(satellite_id: int) -> list[str]:
             product="ABI-L2-CMIP",
             domain="F",
             bands=13,
-            recent=FRAME_LOOKBACK,
+            recent=recent_window,
             return_as="filelist",
             download=False,
             save_dir=gettempdir(),
@@ -286,48 +345,107 @@ def _frames_from_file_refs(satellite: str, file_refs: list[str]) -> list[CMIFram
     return [frame for _, frame in ordered]
 
 
-def discover_recent_frames(satellite: str) -> list[CMIFrame]:
+def discover_recent_frames(satellite: str, lookback_hours: int = LOOKBACK_HOURS) -> list[CMIFrame]:
     satellite_id = SATELLITE_TO_ID.get(satellite)
     if not satellite_id:
         raise CMIFetchError("Unsupported satellite. Use goes-east or goes-west.")
 
     with _upstream_io_lock:
-        file_refs = _list_recent_cmi_file_refs(satellite_id=satellite_id)
+        file_refs = _list_recent_cmi_file_refs(
+            satellite_id=satellite_id,
+            recent_window=_lookback_window(lookback_hours),
+        )
     frames = _frames_from_file_refs(satellite=satellite, file_refs=file_refs)
+    cutoff = _retention_cutoff()
+    frames = [frame for frame in frames if _iso_to_utc_datetime(frame.start_time) >= cutoff]
     if not frames:
         raise CMIFetchError("No recent CMI frames were found.")
     return frames
 
 
-def _download_from_public_bucket(s3_key: str) -> Path:
+def _public_bucket_s3_key(file_ref: str) -> str | None:
+    s3_key = file_ref.removeprefix("s3://")
+    if s3_key.startswith("noaa-goes") and "/" in s3_key:
+        return s3_key
+    return None
+
+
+def _download_from_public_bucket(s3_key: str, refresh: bool = False) -> Path:
     bucket, key = s3_key.split("/", 1)
     local_path = SOURCE_DIR / bucket / key
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    if local_path.exists():
+    if local_path.exists() and not refresh:
         return local_path
+    if refresh:
+        try:
+            local_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove cached CMI source before refresh: %s", local_path, exc_info=True)
 
     url = f"https://{bucket}.s3.amazonaws.com/{key}"
-    try:
-        urlretrieve(url, str(local_path))
-    except (URLError, OSError) as exc:
-        raise CMIFetchError(f"Unable to download CMI file from NOAA: {exc}") from exc
-    return local_path
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            urlretrieve(url, str(local_path))
+            return local_path
+        except (URLError, OSError) as exc:
+            last_error = exc
+            try:
+                local_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove partial CMI download: %s", local_path, exc_info=True)
+
+            if attempt >= DOWNLOAD_ATTEMPTS:
+                break
+
+            logger.warning(
+                "Retrying CMI download after NOAA connection failure: attempt %s/%s url=%s error=%s",
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                url,
+                exc,
+            )
+            time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    raise CMIFetchError(f"Unable to download CMI file from NOAA: {last_error}") from last_error
 
 
-def materialize_file(file_ref: str) -> Path:
+def materialize_file(file_ref: str, refresh: bool = False) -> Path:
     local = Path(file_ref)
-    if local.exists():
+    if local.exists() and not refresh:
         return local
 
-    s3_key = file_ref.removeprefix("s3://")
-    if s3_key.startswith("noaa-goes") and "/" in s3_key:
-        return _download_from_public_bucket(s3_key=s3_key)
+    s3_key = _public_bucket_s3_key(file_ref)
+    if s3_key is not None:
+        return _download_from_public_bucket(s3_key=s3_key, refresh=refresh)
 
     temp_relative = Path(gettempdir()) / file_ref
-    if temp_relative.exists():
+    if temp_relative.exists() and not refresh:
         return temp_relative
 
     raise CMIFetchError(f"goes2go did not return a usable CMI file path: {file_ref}")
+
+
+def _read_cmi_values(nc_path: Path) -> tuple[np.ndarray, float | None]:
+    with NETCDF_LOCK:
+        ds = None
+        try:
+            ds = Dataset(str(nc_path), mode="r")
+            cmi_var = ds.variables["CMI"]
+            cmi_data = cmi_var[:]
+            if isinstance(cmi_data, np.ma.MaskedArray):
+                values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
+            else:
+                values = np.asarray(cmi_data, dtype=np.float32)
+            fill_value = getattr(cmi_var, "_FillValue", None)
+            return values, fill_value
+        except KeyError as exc:
+            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
+        except OSError as exc:
+            raise CMIFetchError(f"Unable to read CMI file with netCDF4: {nc_path}: {exc}") from exc
+        finally:
+            if ds is not None:
+                ds.close()
 
 
 def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[object, object]:
@@ -335,34 +453,39 @@ def _projection_and_transform(nc_path: Path, width: int, height: int) -> tuple[o
     from rasterio.crs import CRS
     from rasterio.transform import from_bounds
 
-    ds = Dataset(str(nc_path), mode="r")
-    try:
-        projection = ds.variables["goes_imager_projection"]
-        sat_height = float(projection.perspective_point_height)
-        semi_major = float(projection.semi_major_axis)
-        semi_minor = float(projection.semi_minor_axis)
-        lon_0 = float(projection.longitude_of_projection_origin)
-        sweep = str(getattr(projection, "sweep_angle_axis", "x"))
+    with NETCDF_LOCK:
+        ds = None
+        try:
+            ds = Dataset(str(nc_path), mode="r")
+            projection = ds.variables["goes_imager_projection"]
+            sat_height = float(projection.perspective_point_height)
+            semi_major = float(projection.semi_major_axis)
+            semi_minor = float(projection.semi_minor_axis)
+            lon_0 = float(projection.longitude_of_projection_origin)
+            sweep = str(getattr(projection, "sweep_angle_axis", "x"))
 
-        x = np.asarray(ds.variables["x"][:], dtype=np.float64) * sat_height
-        y = np.asarray(ds.variables["y"][:], dtype=np.float64) * sat_height
+            x = np.asarray(ds.variables["x"][:], dtype=np.float64) * sat_height
+            y = np.asarray(ds.variables["y"][:], dtype=np.float64) * sat_height
 
-        transform = from_bounds(
-            float(np.min(x)),
-            float(np.min(y)),
-            float(np.max(x)),
-            float(np.max(y)),
-            width,
-            height,
-        )
-        crs = CRS.from_proj4(
-            f"+proj=geos +h={sat_height} +lon_0={lon_0} +a={semi_major} +b={semi_minor} +sweep={sweep} +no_defs"
-        )
-        return crs, transform
-    except KeyError as exc:
-        raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
-    finally:
-        ds.close()
+            transform = from_bounds(
+                float(np.min(x)),
+                float(np.min(y)),
+                float(np.max(x)),
+                float(np.max(y)),
+                width,
+                height,
+            )
+            crs = CRS.from_proj4(
+                f"+proj=geos +h={sat_height} +lon_0={lon_0} +a={semi_major} +b={semi_minor} +sweep={sweep} +no_defs"
+            )
+            return crs, transform
+        except KeyError as exc:
+            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
+        except OSError as exc:
+            raise CMIFetchError(f"Unable to read CMI projection with netCDF4: {nc_path}: {exc}") from exc
+        finally:
+            if ds is not None:
+                ds.close()
 
 
 def _valid_cmi_mask(cmi_values: np.ndarray, fill_value: float | None) -> np.ndarray:
@@ -422,6 +545,10 @@ def frame_metadata_path(satellite: str, frame_id: str) -> Path:
     return METADATA_DIR / satellite / f"{frame_id}.json"
 
 
+def _source_can_refresh(file_ref: str, error: CMIFetchError) -> bool:
+    return _public_bucket_s3_key(file_ref) is not None and isinstance(error.__cause__, OSError)
+
+
 def build_frame_raster(frame: CMIFrame) -> Path:
     _ensure_cache_dirs()
     raster_path = frame_raster_path(satellite=frame.satellite, frame_id=frame.frame_id)
@@ -433,25 +560,33 @@ def build_frame_raster(frame: CMIFrame) -> Path:
         if raster_path.exists():
             return raster_path
 
-        source_path = materialize_file(frame.file_ref)
-        ds = Dataset(str(source_path), mode="r")
-        try:
-            cmi_var = ds.variables["CMI"]
-            cmi_data = cmi_var[:]
-            if isinstance(cmi_data, np.ma.MaskedArray):
-                values = np.asarray(cmi_data.filled(np.nan), dtype=np.float32)
-            else:
-                values = np.asarray(cmi_data, dtype=np.float32)
-            fill_value = getattr(cmi_var, "_FillValue", None)
-        except KeyError as exc:
-            raise CMIFetchError(f"Unexpected CMI file format, missing variable: {exc}") from exc
-        finally:
-            ds.close()
+        last_error: CMIFetchError | None = None
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                source_path = materialize_file(frame.file_ref, refresh=attempt > 1)
+                values, fill_value = _read_cmi_values(source_path)
+                height, width = values.shape
+                crs, transform = _projection_and_transform(source_path, width=width, height=height)
+                break
+            except CMIFetchError as exc:
+                last_error = exc
+                if attempt >= DOWNLOAD_ATTEMPTS or not _source_can_refresh(frame.file_ref, exc):
+                    raise
+                logger.warning(
+                    "Refreshing cached CMI source after netCDF read failure: "
+                    "satellite=%s frame_id=%s attempt=%s/%s error=%s",
+                    frame.satellite,
+                    frame.frame_id,
+                    attempt,
+                    DOWNLOAD_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+        else:
+            raise CMIFetchError(f"Unable to read CMI source: {last_error}") from last_error
 
         gray, alpha = _cmi_to_grayscale(values, fill_value=fill_value)
         coverage = np.where(_valid_cmi_mask(values, fill_value=fill_value), 255, 0).astype(np.uint8)
-        height, width = gray.shape
-        crs, transform = _projection_and_transform(source_path, width=width, height=height)
 
         raster_path.parent.mkdir(parents=True, exist_ok=True)
         profile = {
@@ -643,8 +778,17 @@ def get_prepared_image_artifacts(satellite: str, frame_id: str) -> tuple[Path, l
     return render_frame_image(frame=frame)
 
 
-def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> None:
-    cutoff_epoch = time() - retention_seconds
+def _path_frame_timestamp(path: Path) -> datetime | None:
+    try:
+        stem = path.stem if path.suffix else path.name
+        start_token, _ = _extract_tokens(stem)
+    except CMIFetchError:
+        return None
+    return _iso_to_utc_datetime(_goes_token_to_iso(start_token))
+
+
+def cleanup_stale_cache(now: datetime | None = None) -> None:
+    cutoff = _retention_cutoff(now=now)
     for root in (SOURCE_DIR, RASTER_DIR, IMAGE_DIR, METADATA_DIR):
         if not root.exists():
             continue
@@ -652,7 +796,10 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
             if not path.is_file():
                 continue
             try:
-                if path.stat().st_mtime < cutoff_epoch:
+                frame_timestamp = _path_frame_timestamp(path)
+                if frame_timestamp is None:
+                    continue
+                if frame_timestamp < cutoff:
                     path.unlink(missing_ok=True)
             except OSError:
                 logger.exception("Failed to remove stale CMI cache file: %s", path)
@@ -665,23 +812,38 @@ def cleanup_stale_cache(retention_seconds: int = FRAME_RETENTION_SECONDS) -> Non
 
 
 def _prepare_latest_frame(satellite: str) -> None:
-    frames = discover_recent_frames(satellite)
+    frames = discover_recent_frames(satellite, lookback_hours=INCREMENTAL_LOOKBACK_HOURS)
     if frames:
         prepare_frame_with_tracking(frames[0])
+
+
+def _prepare_missing_frames(frames: list[CMIFrame]) -> None:
+    for frame in reversed(frames):
+        if not _frame_is_within_retention(frame):
+            continue
+        if has_frame(frame.satellite, frame.frame_id):
+            continue
+        try:
+            prepare_frame_with_tracking(frame)
+        except CMIFetchError as exc:
+            logger.warning(
+                "Skipping CMI frame after fetch failure: satellite=%s frame_id=%s error=%s",
+                frame.satellite,
+                frame.frame_id,
+                exc,
+            )
 
 
 def _poll_once() -> None:
     for satellite in SATELLITE_TO_ID:
         try:
-            frames = discover_recent_frames(satellite)
-            for frame in reversed(frames[:FRAME_RETENTION_COUNT]):
-                if has_frame(frame.satellite, frame.frame_id):
-                    continue
-                prepare_frame_with_tracking(frame)
+            frames = discover_recent_frames(satellite, lookback_hours=INCREMENTAL_LOOKBACK_HOURS)
+            _prepare_missing_frames(frames)
         except CMIFetchError:
             logger.exception("Failed to refresh latest CMI frames for %s", satellite)
         except Exception:
             logger.exception("Unexpected error refreshing CMI frames for %s", satellite)
+    prune_expired_frames()
     cleanup_stale_cache()
 
 
@@ -702,6 +864,19 @@ def _warm_latest_then_poll_loop() -> None:
         except Exception:
             logger.exception("Unexpected error warming latest CMI frame for %s", satellite)
 
+    for satellite in SATELLITE_TO_ID:
+        if _poller_stop_event.is_set():
+            return
+        try:
+            frames = discover_recent_frames(satellite, lookback_hours=LOOKBACK_HOURS)
+            _prepare_missing_frames(frames)
+        except CMIFetchError:
+            logger.exception("Failed to backfill CMI history for %s", satellite)
+        except Exception:
+            logger.exception("Unexpected error backfilling CMI history for %s", satellite)
+
+    prune_expired_frames()
+    cleanup_stale_cache()
     _poll_loop()
 
 

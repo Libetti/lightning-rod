@@ -12,6 +12,7 @@ from urllib.request import urlretrieve
 
 from netCDF4 import Dataset, num2date
 
+from app.native_locks import NETCDF_LOCK
 from glm.store import FlashEvent, GLMFetchError, GLMFrame, get_cached_frame_id, store_latest_points
 
 logger = logging.getLogger(__name__)
@@ -175,53 +176,54 @@ def latest_glm_file(satellite_id: int) -> Path:
 
 
 def parse_flashes_direct(nc_path: Path, limit: int | None = None) -> list[FlashEvent]:
-    ds = Dataset(str(nc_path), mode="r")
-    try:
-        flash_id_var = ds.variables["flash_id"]
-        flash_lat_var = ds.variables["flash_lat"]
-        flash_lon_var = ds.variables["flash_lon"]
-        flash_time_var = ds.variables["flash_time_offset_of_first_event"]
-        flash_energy_var = ds.variables.get("flash_energy")
+    with NETCDF_LOCK:
+        ds = Dataset(str(nc_path), mode="r")
+        try:
+            flash_id_var = ds.variables["flash_id"]
+            flash_lat_var = ds.variables["flash_lat"]
+            flash_lon_var = ds.variables["flash_lon"]
+            flash_time_var = ds.variables["flash_time_offset_of_first_event"]
+            flash_energy_var = ds.variables.get("flash_energy")
 
-        ids = flash_id_var[:]
-        lats = flash_lat_var[:]
-        lons = flash_lon_var[:]
-        times = num2date(
-            flash_time_var[:],
-            units=flash_time_var.units,
-            only_use_cftime_datetimes=False,
-            only_use_python_datetimes=True,
-        )
-        energies = flash_energy_var[:] if flash_energy_var is not None else None
-
-        size = len(ids) if limit is None else min(len(ids), limit)
-        events: list[FlashEvent] = []
-        for i in range(size):
-            time_value = times[i]
-            if isinstance(time_value, datetime):
-                time_iso = time_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            else:
-                time_iso = str(time_value)
-
-            energy_val: float | None = None
-            if energies is not None:
-                energy_candidate = float(energies[i])
-                if energy_candidate == energy_candidate:
-                    energy_val = energy_candidate
-
-            events.append(
-                FlashEvent(
-                    id=str(ids[i]),
-                    latitude=float(lats[i]),
-                    longitude=float(lons[i]),
-                    time=time_iso,
-                    energy=energy_val,
-                )
+            ids = flash_id_var[:]
+            lats = flash_lat_var[:]
+            lons = flash_lon_var[:]
+            times = num2date(
+                flash_time_var[:],
+                units=flash_time_var.units,
+                only_use_cftime_datetimes=False,
+                only_use_python_datetimes=True,
             )
+            energies = flash_energy_var[:] if flash_energy_var is not None else None
 
-        return events
-    finally:
-        ds.close()
+            size = len(ids) if limit is None else min(len(ids), limit)
+            events: list[FlashEvent] = []
+            for i in range(size):
+                time_value = times[i]
+                if isinstance(time_value, datetime):
+                    time_iso = time_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                else:
+                    time_iso = str(time_value)
+
+                energy_val: float | None = None
+                if energies is not None:
+                    energy_candidate = float(energies[i])
+                    if energy_candidate == energy_candidate:
+                        energy_val = energy_candidate
+
+                events.append(
+                    FlashEvent(
+                        id=str(ids[i]),
+                        latitude=float(lats[i]),
+                        longitude=float(lons[i]),
+                        time=time_iso,
+                        energy=energy_val,
+                    )
+                )
+
+            return events
+        finally:
+            ds.close()
 
 
 def refresh_latest_lightning(satellite: str = "goes-east") -> GLMFrame:
