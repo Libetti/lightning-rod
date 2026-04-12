@@ -27,11 +27,13 @@ from glm.service import (
     stop_background_refresh as stop_glm_background_refresh,
 )
 from app.runtime_diagnostics import (
+    configure_logging,
     install_asyncio_exception_handler,
     install_runtime_diagnostics,
 )
 
 
+configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Lightning Rod", version="0.1.0")
