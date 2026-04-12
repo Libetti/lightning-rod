@@ -58,16 +58,19 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-older.nc",
         )
 
-        store.store_prepared_frame(newest)
-        store.store_prepared_frame(older)
+        with patch("cmi.store.datetime") as datetime_mock:
+            datetime_mock.now.return_value = cmi.datetime(2026, 4, 6, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
+            store.store_prepared_frame(newest)
+            store.store_prepared_frame(older)
 
-        frames = store.get_frames_in_range(
-            "goes-east",
-            start="2026-04-06T09:00:00Z",
-            end="2026-04-06T11:00:00Z",
-            limit=2,
-        )
-        latest, _ = store.get_latest_frame("goes-east")
+            frames = store.get_frames_in_range(
+                "goes-east",
+                start="2026-04-06T09:00:00Z",
+                end="2026-04-06T11:00:00Z",
+                limit=2,
+            )
+            latest, _ = store.get_latest_frame("goes-east")
 
         self.assertEqual([frame.frame_id for frame in frames], ["frame-newest", "frame-older"])
         self.assertEqual(latest.frame_id, "frame-newest")
@@ -195,17 +198,21 @@ class CMIUnitTests(unittest.TestCase):
             file_ref="s3://noaa-goes19/path/frame-1.nc",
         )
 
-        with patch.object(cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")), patch.object(
+        with patch("cmi.store.datetime") as datetime_mock, patch.object(
+            cmi, "build_frame_raster", return_value=Path("/tmp/frame-1.tif")
+        ), patch.object(
             cmi,
             "render_frame_image",
             return_value=(Path("/tmp/frame-1.png"), [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]]),
         ):
+            datetime_mock.now.return_value = cmi.datetime(2026, 3, 16, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
             prepared = cmi.prepare_frame(frame)
 
-        from cmi import store
+            from cmi import store
 
-        self.assertEqual(prepared, frame)
-        self.assertTrue(store.has_frame("goes-east", "frame-1"))
+            self.assertEqual(prepared, frame)
+            self.assertTrue(store.has_frame("goes-east", "frame-1"))
 
     def test_get_prepared_image_artifacts_renders_on_demand(self) -> None:
         frame = cmi.CMIFrame(
@@ -218,15 +225,18 @@ class CMIUnitTests(unittest.TestCase):
 
         from cmi import store
 
-        store.store_prepared_frame(frame)
+        with patch("cmi.store.datetime") as datetime_mock:
+            datetime_mock.now.return_value = cmi.datetime(2026, 3, 16, 11, tzinfo=cmi.timezone.utc)
+            datetime_mock.fromisoformat.side_effect = cmi.datetime.fromisoformat
+            store.store_prepared_frame(frame)
 
-        coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
-        image_path = Path("/tmp/frame-1.png")
-        with patch.object(cmi, "render_frame_image", return_value=(image_path, coordinates)) as render_mock:
-            resolved, actual_coordinates = cmi.get_prepared_image_artifacts(
-                satellite="goes-east",
-                frame_id="frame-1",
-            )
+            coordinates = [[-140.0, 55.0], [-60.0, 55.0], [-60.0, -10.0], [-140.0, -10.0]]
+            image_path = Path("/tmp/frame-1.png")
+            with patch.object(cmi, "render_frame_image", return_value=(image_path, coordinates)) as render_mock:
+                resolved, actual_coordinates = cmi.get_prepared_image_artifacts(
+                    satellite="goes-east",
+                    frame_id="frame-1",
+                )
 
         self.assertEqual(resolved, image_path)
         self.assertEqual(actual_coordinates, coordinates)
@@ -280,6 +290,60 @@ class CMIUnitTests(unittest.TestCase):
                 file_refs = cmi._list_recent_cmi_file_refs(19, recent_window="48h")
 
         self.assertEqual(file_refs, [str(cached)])
+
+    def test_download_from_public_bucket_retries_connection_reset(self) -> None:
+        calls: list[str] = []
+
+        def _fake_urlretrieve(url: str, filename: str) -> tuple[str, None]:
+            calls.append(url)
+            if len(calls) == 1:
+                Path(filename).write_bytes(b"partial")
+                raise ConnectionResetError("reset by peer")
+            Path(filename).write_bytes(b"nc")
+            return filename, None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_dir = Path(tmp_dir) / "source"
+            with patch.object(cmi, "SOURCE_DIR", source_dir), patch.object(
+                cmi, "urlretrieve", side_effect=_fake_urlretrieve
+            ), patch.object(cmi.time, "sleep") as sleep_mock:
+                path = cmi._download_from_public_bucket("noaa-goes19/path/frame.nc")
+                downloaded = path.read_bytes()
+
+        self.assertEqual(path.name, "frame.nc")
+        self.assertEqual(downloaded, b"nc")
+        self.assertEqual(len(calls), 2)
+        sleep_mock.assert_called_once_with(cmi.DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    def test_prepare_missing_frames_skips_failed_frame_and_continues(self) -> None:
+        failed = cmi.CMIFrame(
+            frame_id="frame-failed",
+            satellite="goes-east",
+            start_time="2026-03-16T10:00:00Z",
+            end_time="2026-03-16T10:09:59Z",
+            file_ref="s3://noaa-goes19/path/frame-failed.nc",
+        )
+        next_frame = cmi.CMIFrame(
+            frame_id="frame-next",
+            satellite="goes-east",
+            start_time="2026-03-16T10:10:00Z",
+            end_time="2026-03-16T10:19:59Z",
+            file_ref="s3://noaa-goes19/path/frame-next.nc",
+        )
+
+        with patch.object(cmi, "_frame_is_within_retention", return_value=True), patch.object(
+            cmi, "has_frame", return_value=False
+        ), patch.object(
+            cmi,
+            "prepare_frame_with_tracking",
+            side_effect=[cmi.CMIFetchError("reset by peer"), next_frame],
+        ) as prepare_mock:
+            cmi._prepare_missing_frames([next_frame, failed])
+
+        self.assertEqual(
+            [call.args[0].frame_id for call in prepare_mock.call_args_list],
+            ["frame-failed", "frame-next"],
+        )
 
     def test_render_frame_image_ignores_not_georeferenced_warning_when_promoted_to_error(self) -> None:
         frame = cmi.CMIFrame(

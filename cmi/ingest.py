@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -69,6 +70,8 @@ TEMP_VISIBLE_CLOUD_K = _env_positive_float("CMI_VISIBLE_CLOUD_TEMP_K", 270.0)
 TEMP_DENSE_CLOUD_K = _env_positive_float("CMI_DENSE_CLOUD_TEMP_K", 235.0)
 EDGE_SMOOTH_RADIUS = _env_positive_int("CMI_EDGE_SMOOTH_RADIUS", 2)
 EDGE_SMOOTH_PASSES = _env_positive_int("CMI_EDGE_SMOOTH_PASSES", 2)
+DOWNLOAD_ATTEMPTS = _env_positive_int("CMI_DOWNLOAD_ATTEMPTS", 3)
+DOWNLOAD_RETRY_DELAY_SECONDS = _env_positive_float("CMI_DOWNLOAD_RETRY_DELAY_SECONDS", 1.0)
 
 if INCREMENTAL_LOOKBACK_HOURS > LOOKBACK_HOURS:
     raise RuntimeError(
@@ -367,11 +370,31 @@ def _download_from_public_bucket(s3_key: str) -> Path:
         return local_path
 
     url = f"https://{bucket}.s3.amazonaws.com/{key}"
-    try:
-        urlretrieve(url, str(local_path))
-    except (URLError, OSError) as exc:
-        raise CMIFetchError(f"Unable to download CMI file from NOAA: {exc}") from exc
-    return local_path
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            urlretrieve(url, str(local_path))
+            return local_path
+        except (URLError, OSError) as exc:
+            last_error = exc
+            try:
+                local_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove partial CMI download: %s", local_path, exc_info=True)
+
+            if attempt >= DOWNLOAD_ATTEMPTS:
+                break
+
+            logger.warning(
+                "Retrying CMI download after NOAA connection failure: attempt %s/%s url=%s error=%s",
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                url,
+                exc,
+            )
+            time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    raise CMIFetchError(f"Unable to download CMI file from NOAA: {last_error}") from last_error
 
 
 def materialize_file(file_ref: str) -> Path:
@@ -742,16 +765,28 @@ def _prepare_latest_frame(satellite: str) -> None:
         prepare_frame_with_tracking(frames[0])
 
 
+def _prepare_missing_frames(frames: list[CMIFrame]) -> None:
+    for frame in reversed(frames):
+        if not _frame_is_within_retention(frame):
+            continue
+        if has_frame(frame.satellite, frame.frame_id):
+            continue
+        try:
+            prepare_frame_with_tracking(frame)
+        except CMIFetchError as exc:
+            logger.warning(
+                "Skipping CMI frame after fetch failure: satellite=%s frame_id=%s error=%s",
+                frame.satellite,
+                frame.frame_id,
+                exc,
+            )
+
+
 def _poll_once() -> None:
     for satellite in SATELLITE_TO_ID:
         try:
             frames = discover_recent_frames(satellite, lookback_hours=INCREMENTAL_LOOKBACK_HOURS)
-            for frame in reversed(frames):
-                if not _frame_is_within_retention(frame):
-                    continue
-                if has_frame(frame.satellite, frame.frame_id):
-                    continue
-                prepare_frame_with_tracking(frame)
+            _prepare_missing_frames(frames)
         except CMIFetchError:
             logger.exception("Failed to refresh latest CMI frames for %s", satellite)
         except Exception:
@@ -782,10 +817,7 @@ def _warm_latest_then_poll_loop() -> None:
             return
         try:
             frames = discover_recent_frames(satellite, lookback_hours=LOOKBACK_HOURS)
-            for frame in reversed(frames):
-                if has_frame(frame.satellite, frame.frame_id):
-                    continue
-                prepare_frame_with_tracking(frame)
+            _prepare_missing_frames(frames)
         except CMIFetchError:
             logger.exception("Failed to backfill CMI history for %s", satellite)
         except Exception:

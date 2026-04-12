@@ -136,10 +136,10 @@ class MainCMIEndpointTests(unittest.TestCase):
         self.assertEqual(payload.satellite, "goes-east")
         self.assertEqual(payload.count, 2)
         self.assertEqual(payload.poll_interval_seconds, 10)
-        self.assertEqual(payload.frames[0].frame_id, "frame-new")
+        self.assertEqual(payload.frames[0].frame_id, "frame-old")
         self.assertEqual(
             payload.frames[0].image_url,
-            "http://testserver/imagery/cmi/ch13/images/goes-east/frame-new.png",
+            "http://testserver/imagery/cmi/ch13/images/goes-east/frame-old.png",
         )
         self.assertEqual(payload.frames[0].coordinates, [tuple(point) for point in coordinates])
         self.assertEqual(image_mock.call_count, 2)
